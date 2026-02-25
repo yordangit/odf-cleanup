@@ -161,7 +161,6 @@ sequenceDiagram
 #### Methods:
 - `add_child()` - Adds child image to establish parent-child relationship
 - `has_descendants()` - Checks if image has children or internal snapshots
-- `get_all_descendants()` - Recursively gets all descendant images
 
 ### 3. `OdfTree`
 **Purpose:** Manages hierarchical tree structure of ODF RBD images
@@ -224,7 +223,6 @@ sequenceDiagram
 - Returns list of referenced trash CSI snapshots
 
 #### Helper Methods for Discovery:
-- `_is_image_in_trash()` - Checks if image exists in trash
 - `_is_trash_item_referenced()` - Checks if trash item is referenced by active images
 - `_create_image_from_rbd()` - Creates OdfImage from active RBD image with full metadata
 - `_create_trash_image()` - Creates OdfImage from trash item

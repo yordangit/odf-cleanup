@@ -17,18 +17,14 @@ The script uses a **three-phase approach** with **direct matching**, **comprehen
 
 ### Phase 1: Direct GUID Matching
 ```python
-def _find_trash_images(self) -> List[OdfImage]:
-    """Find images in trash containing LAB GUID"""
-    images = []
-    try:
-        trash_items = rbd.RBD().trash_list(self.ioctx)
-        lab_trash = [item for item in trash_items if self.lab_guid in item['name']]
-        
-        for item in lab_trash:
-            if 'csi-snap' not in item['name']:  # Regular images, not csi-snaps
-                image = self._create_trash_image(item, ImageType.TRASH_VOLUME)
-                if image:
-                    images.append(image)
+def _find_images_by_criteria(self, source: str, guid_check: bool, csi_only: bool) -> List[OdfImage]:
+    """Find images from pool or trash filtered by GUID and type"""
+    # source = "pool" or "trash"
+    # Filters by GUID presence in name and csi-snap vs regular volume
+    # Called three times: pool volumes, trash volumes, pool csi-snaps
+    pool_images  = self._find_images_by_criteria("pool",  guid_check=True, csi_only=False)
+    trash_images = self._find_images_by_criteria("trash", guid_check=True, csi_only=False)
+    csi_snaps    = self._find_images_by_criteria("pool",  guid_check=True, csi_only=True)
 ```
 
 ### Phase 2: Comprehensive Descendant Analysis
@@ -62,7 +58,7 @@ trash_csi_snaps = self._find_trash_csi_snaps()
 all_discovered = initial_images + additional_images + trash_csi_snaps
 
 # Build hierarchical tree with proper relationships
-self.tree.build_tree(all_discovered)
+self.build_tree(all_discovered)
 ```
 
 ## Cleanup Execution Flow
