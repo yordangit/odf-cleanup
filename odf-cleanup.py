@@ -53,14 +53,6 @@ class OdfImage:
         """Check if image has any descendants"""
         return len(self.children) > 0 or len(self.internal_snaps) > 0
     
-    def get_all_descendants(self) -> List['OdfImage']:
-        """Get all descendants recursively"""
-        descendants = []
-        for child in self.children:
-            descendants.append(child)
-            descendants.extend(child.get_all_descendants())
-        return descendants
-
 
 class OdfTree:
     """Manages the hierarchical tree of ODF RBD images"""
@@ -178,6 +170,7 @@ class OdfCleaner:
     
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
+        self.debug = os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
         self.ioctx = None
         self.lab_guid = None
         self.pool_name = None
@@ -218,8 +211,7 @@ class OdfCleaner:
             self.cluster.connect()
             self.ioctx = self.cluster.open_ioctx(self.pool_name)
             
-            debug = os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
-            if debug:
+            if self.debug:
                 print(f"Connected to ODF cluster: {self.cluster.get_fsid()}")
                 print(f"librados version: {self.cluster.version()}")
                 print(f"Monitor hosts: {self.cluster.conf_get('mon host')}")
@@ -350,6 +342,7 @@ class OdfCleaner:
         all_additional = []
         active_to_trash_deps = {}
         discovered_names = {img.name for img in discovered_images}
+        image_lookup: Dict[str, OdfImage] = {img.name: img for img in discovered_images}
         
         # Start with originally discovered active images
         images_to_scan = [img for img in discovered_images if not img.in_trash]
@@ -385,13 +378,10 @@ class OdfCleaner:
                                 active_to_trash_deps[image.name].append(desc_name)
                                 
                                 # Also update parent relationship for trash item (only if no parent set)
-                                existing_images = discovered_images + all_additional
-                                for existing_img in existing_images:
-                                    if existing_img.name == desc_name:
-                                        if not existing_img.parent_name:
-                                            existing_img.parent_name = image.name
-                                            print(f"    Updated trash parent: {desc_name} -> {image.name}")
-                                        break
+                                existing_img = image_lookup.get(desc_name)
+                                if existing_img and not existing_img.parent_name:
+                                    existing_img.parent_name = image.name
+                                    print(f"    Updated trash parent: {desc_name} -> {image.name}")
                                 continue
                             
                             # Handle active descendants - add to discovery
@@ -404,20 +394,16 @@ class OdfCleaner:
                                     current_batch.append(new_image)
                                     all_additional.append(new_image)
                                     discovered_names.add(desc_name)
+                                    image_lookup[desc_name] = new_image
                             else:
                                 # Handle already-discovered descendant - update parent relationship (only if no parent set)
-                                # Find the existing image and update its parent
-                                existing_images = discovered_images + all_additional
-                                for existing_img in existing_images:
-                                    if existing_img.name == desc_name:
-                                        if not existing_img.parent_name:
-                                            existing_img.parent_name = image.name
-                                            print(f"    Updated parent: {desc_name} -> {image.name}")
-                                        break
+                                existing_img = image_lookup.get(desc_name)
+                                if existing_img and not existing_img.parent_name:
+                                    existing_img.parent_name = image.name
+                                    print(f"    Updated parent: {desc_name} -> {image.name}")
                                     
                 except Exception as e:
-                    debug = os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
-                    if debug:
+                    if self.debug:
                         print(f"    DEBUG: Error scanning descendants of {image.name}: {e}")
                     continue
             
@@ -433,16 +419,6 @@ class OdfCleaner:
             print(f"    Found {dep_count} active->trash dependencies")
         
         return all_additional, active_to_trash_deps
-    
-    def _is_image_in_trash(self, image_name: str) -> bool:
-        """Check if an image is currently in trash"""
-        try:
-            trash_items = rbd.RBD().trash_list(self.ioctx)
-            trash_names = [item['name'] for item in trash_items]
-            return image_name in trash_names
-        except Exception as e:
-            print(f"Warning: Could not check trash status for {image_name}: {e}")
-            return False
     
     def _is_trash_item_referenced(self, trash_item: dict, active_dependencies: Dict[str, List[str]]) -> bool:
         """Check if a trash item is referenced by any active LAB images"""
@@ -740,8 +716,7 @@ class OdfCleaner:
                 active_images = rbd.RBD().list(self.ioctx)
                 return item.name in active_images
         except Exception as e:
-            debug = os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
-            if debug:
+            if self.debug:
                 print(f"  Warning: Error checking existence of {item.name}: {e}")
             # If we can't check, assume it still exists to be safe
             return True
@@ -1087,7 +1062,7 @@ class OdfCleaner:
                 return True
             
             # Tree building phase
-            debug_mode = self.dry_run or os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
+            debug_mode = self.dry_run or self.debug
             self.build_tree(discovered_items, debug=debug_mode)
             
             # Display tree
