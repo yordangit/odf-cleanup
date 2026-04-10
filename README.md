@@ -204,7 +204,7 @@ pip install kubernetes
 
 ### ODF Cleanup Script
 ```console
-git clone https://github.com/yvarbanov/odf-cleanup.git odf-cleanup
+git clone https://github.com/yordangit/odf-cleanup.git odf-cleanup
 cd odf-cleanup
 source env.sh
 # Edit env.sh with your specific values

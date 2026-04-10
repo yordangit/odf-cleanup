@@ -4,7 +4,7 @@
 This script checks all jobs in the 'cleanup' namespace, analyzes their logs,
 and reports any failed cleanup operations with GUID and error details.
 
-Author: yvarbev@redhat.com, gh:@yvarbanov
+Author: yvarbev@redhat.com, gh:@yordangit
 Version: 25.08.04
 """
 

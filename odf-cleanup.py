@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deletes ODF objects based on a LAB GUID using a hierarchical tree approach.
 
-Author:  yvarbev@redhat.com, gh:@yvarbanov
+Author:  yvarbev@redhat.com, gh:@yordangit
 Version: 25.08.04
 """
 

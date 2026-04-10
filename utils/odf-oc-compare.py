@@ -11,7 +11,7 @@ Requirements:
 - Valid kubeconfig with access to Kubernetes/OpenShift cluster
 - ODF cluster credentials (CL_CONF, CL_KEYRING environment variables)
 
-Author:  yvarbev@redhat.com, gh:@yvarbanov
+Author:  yvarbev@redhat.com, gh:@yordangit
 Version: 25.08.04
 """
 
