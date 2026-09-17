@@ -19,6 +19,10 @@ from kubernetes import client, config
 # Disable SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Patterns to extract GUID from ODF image names
+CLUSTER_NAME_PREFIXES = ('ocp4-cluster', 'openshift-cluster')
+VOLUME_GUID_PATTERN = r'(?:' + '|'.join(CLUSTER_NAME_PREFIXES) + r')-([a-z0-9]+)-[a-f0-9-]+'
+
 
 class CleanupJobMonitor:
     """Monitor and analyze ODF cleanup jobs for failures"""
@@ -119,12 +123,18 @@ class CleanupJobMonitor:
     def extract_guid_from_logs(self, logs: str) -> Optional[str]:
         """Extract GUID from log content"""
         # Look for volume names in processing lines
-        volume_pattern = r'ocp4-cluster-([a-z0-9]+)-[a-f0-9-]+'
-        match = re.search(volume_pattern, logs)
+        match = re.search(VOLUME_GUID_PATTERN, logs)
         if match:
             return match.group(1)
             
-        # Look for LAB GUID in configuration output
+        # Look for LAB GUID in configuration output - try stripping a known
+        # cluster-name prefix first (CL_LAB may be the full "{config}-{guid}"),
+        # then fall back to treating the whole value as the guid.
+        prefixed_pattern = r'LAB GUID:\s*(?:' + '|'.join(CLUSTER_NAME_PREFIXES) + r')-([a-z0-9]+)'
+        match = re.search(prefixed_pattern, logs)
+        if match:
+            return match.group(1)
+
         config_pattern = r'LAB GUID:\s*([a-z0-9]+)'
         match = re.search(config_pattern, logs)
         if match:

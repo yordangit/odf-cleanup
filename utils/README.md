@@ -5,6 +5,7 @@ Supporting tools for ODF cleanup operations - discovery and monitoring utilities
 ## Tools Overview
 
 - **odf-oc-compare.py** - Discovery tool that identifies orphaned storage by comparing OpenShift namespaces with ODF volumes
+- **odf-descendant-reaper.py** - Discovers and classifies stranded RBD descendant chains blocking `odf-cleanup.py`, with an optional execute mode
 - **odf-cleanup-monitor.py** - Monitoring tool that analyzes cleanup job failures and generates reports
 
 ---
@@ -56,6 +57,35 @@ The script generates:
 
 ---
 
+## ODF Descendant Reaper
+
+The `odf-descendant-reaper.py` script discovers and classifies stranded RBD descendant chains that block `odf-cleanup.py` with a "still has active descendants" error. It rebuilds the true parent/child tree for a GUID (or a specific volume), classifies each chain, and can remove what's safe directly via the RBD Python bindings.
+
+### Key Features
+
+- **Descendant Chain Analysis** - Rebuilds the real parent/child tree via `parent_info()`, not a flat `list_descendants()` dump
+- **Classification** - `SAFE_TO_REMOVE` (zero watchers throughout, terminal chain), `NEEDS_REVIEW` (active watchers or depth limit hit), or `ERROR` (volume couldn't be opened)
+- **Phantom Entry Detection** - Catches the case where `rbd_id.<name>` exists but its `rbd_header.<id>` is missing, and can clean up the dangling pointer
+- **Execute Mode** - `DRY_RUN=false` removes `SAFE_TO_REMOVE` chains and confirmed phantom entries (same convention as `odf-cleanup.py`)
+
+### Usage
+
+```console
+cd odf-cleanup
+source env.sh
+export CL_LAB="your-guid"      # or CL_VOLUME="specific-image-name"
+export DRY_RUN="true"          # false to actually remove what's classified safe
+python3 utils/odf-descendant-reaper.py
+```
+
+### Output
+
+- Per-chain breakdown with watcher/timestamp/snapshot detail and classification
+- Manual removal order (leaf-first `rbd snap unprotect`/`rbd snap rm`/`rbd rm`) for review
+- In execute mode, performs the removals directly instead of just printing them
+
+---
+
 ## ODF Cleanup Monitor
 
 The `odf-cleanup-monitor.py` script monitors ODF cleanup jobs in OpenShift and reports failures. It analyzes job logs to identify failed cleanup operations and generates reports for manual intervention.
@@ -96,12 +126,13 @@ pip install kubernetes rados rbd
 ```
 
 ### Access Requirements
-- **ODF Cluster**: Configuration file and keyring (for comparison tool)
+- **ODF Cluster**: Configuration file and keyring (for comparison tool and descendant reaper)
 - **OpenShift/Kubernetes**: Valid kubeconfig or in-cluster service account
 - **Namespace Access**: Read permissions for target namespaces and cleanup jobs
 
 ### Environment Variables
 - **Comparison tool**: `CL_POOL`, `CL_CONF`, `CL_KEYRING` (CL_LAB not required)
+- **Descendant reaper**: `CL_POOL`, `CL_CONF`, `CL_KEYRING`, and either `CL_LAB` or `CL_VOLUME`; optional `MAX_CHAIN_DEPTH` (default: 10), `DRY_RUN` (default: "true")
 - **Monitor tool**: None required (uses kubeconfig/service account)
 
 ---

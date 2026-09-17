@@ -186,11 +186,15 @@ class OdfCleaner:
         self._active_to_trash_dependencies = None
         # Track failed trash restorations
         self._failed_trash_restorations = set()
+        # Errors during discovery (e.g. a transient rbd.RBD().list() failure) -
+        # must never be conflated with "genuinely found nothing to clean up".
+        self._discovery_errors: List[str] = []
     
     def _clear_dependency_cache(self):
         """Clear cached dependency analysis"""
         self._active_to_trash_dependencies = None
         self._failed_trash_restorations = set()
+        self._discovery_errors = []
     
     def connect(self):
         """Connect to ODF cluster"""
@@ -308,6 +312,7 @@ class OdfCleaner:
                     
         except Exception as e:
             print(f"Error finding {source} images: {e}")
+            self._discovery_errors.append(f"{source} images (csi_only={csi_only}): {e}")
         
         return images
     
@@ -334,6 +339,7 @@ class OdfCleaner:
                     
         except Exception as e:
             print(f"Error finding trash csi-snaps: {e}")
+            self._discovery_errors.append(f"trash csi-snaps: {e}")
         
         return csi_snaps
     
@@ -438,17 +444,16 @@ class OdfCleaner:
             with rbd.Image(self.ioctx, img_name) as img:
                 # Get image info
                 stat = img.stat()
-                
-                # Get creation time if available
                 creation_time = None
                 try:
-                    timestamp = stat.get('timestamp', 0)
-                    # Check if timestamp is valid (not epoch 0)
-                    if timestamp and timestamp > 0:
-                        creation_time = str(datetime.fromtimestamp(timestamp))
+                    ts = img.create_timestamp()
+                    if isinstance(ts, datetime):
+                        creation_time = str(ts)
+                    elif ts:
+                        creation_time = str(datetime.fromtimestamp(ts))
                     else:
                         creation_time = "Unknown"
-                except Exception as ts_err:
+                except Exception:
                     creation_time = "Unknown"
                 
                 # Get parent info
@@ -1058,6 +1063,13 @@ class OdfCleaner:
             # Discovery phase
             discovered_items = self.discover_images()
             if not discovered_items:
+                if self._discovery_errors:
+                    # Errored, not empty - don't report false success.
+                    print(f"ERROR: Discovery failed for GUID {self.lab_guid} - "
+                          f"cannot confirm there is nothing to clean up:")
+                    for err in self._discovery_errors:
+                        print(f"  - {err}")
+                    return False
                 print("No items found for cleanup")
                 return True
             

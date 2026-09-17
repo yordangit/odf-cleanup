@@ -9,10 +9,12 @@ This script discovers:
 Requirements:
 - Python packages: pip install kubernetes rados rbd
 - Valid kubeconfig with access to Kubernetes/OpenShift cluster
+  (needs cluster-scoped read access to VolumeSnapshotContents, used to verify
+  parentless CSI snapshot ownership before recommending deletion)
 - ODF cluster credentials (CL_CONF, CL_KEYRING environment variables)
 
-Author:  yvarbev@redhat.com, gh:@yordangit
-Version: 25.08.04
+Author:  gh:@yordangit
+Version: 26.09.17
 """
 
 import rbd
@@ -27,6 +29,10 @@ from kubernetes import client, config
 # Suppress SSL warnings for kubernetes API calls
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Patterns to extract GUID from ODF image names
+CLUSTER_NAME_PREFIXES = ('ocp4-cluster', 'openshift-cluster')
+VOLUME_GUID_PATTERN = re.compile(r'(?:' + '|'.join(CLUSTER_NAME_PREFIXES) + r')-([a-z0-9]+)-[a-f0-9-]+')
+
 
 class OdfOpenShiftComparator:
     """Main class for comparing ODF volumes with OpenShift namespaces"""
@@ -39,8 +45,15 @@ class OdfOpenShiftComparator:
         
         # Results
         self.active_namespace_guids: Set[str] = set()
+        self.all_namespace_names: Set[str] = set()
         self.odf_guids: Set[str] = set()
         self.orphaned_guids: Set[str] = set()
+
+        # VolumeSnapshotContent objects, used to check real Kubernetes ownership
+        # of parentless CSI snapshots (a csi-snap can have zero RBD children and
+        # still be actively backing a live VolumeSnapshot). None means "couldn't
+        # load them" (fail safe into REVIEW), [] means "loaded, there are none".
+        self.volume_snapshot_contents: Optional[List[Dict]] = None
         
         # Cache for CSI snapshot parent lookups to avoid re-evaluation
         self.csi_snap_guid_cache: Dict[str, Optional[str]] = {}
@@ -121,6 +134,7 @@ class OdfOpenShiftComparator:
             namespace_pattern = re.compile(r'sandbox-([a-z0-9]+)-')
             
             self.stats['namespaces_found'] = len(namespaces.items)
+            self.all_namespace_names = {ns.metadata.name for ns in namespaces.items}
             
             for namespace in namespaces.items:
                 namespace_name = namespace.metadata.name
@@ -140,7 +154,25 @@ class OdfOpenShiftComparator:
             print(f"[x] Error discovering namespaces: {e}")
             print("  Make sure kubeconfig is valid and you have access to the cluster")
             return False
-    
+
+    def discover_volume_snapshot_contents(self) -> bool:
+        """Load all VolumeSnapshotContents so we can verify csi-snap ownership.
+        Non-fatal on failure - callers fall back to REVIEW."""
+        print("Discovering VolumeSnapshotContent objects from OpenShift...")
+        try:
+            custom_api = client.CustomObjectsApi()
+            result = custom_api.list_cluster_custom_object(
+                group="snapshot.storage.k8s.io", version="v1", plural="volumesnapshotcontents"
+            )
+            self.volume_snapshot_contents = result.get('items', [])
+            print(f"  Found {len(self.volume_snapshot_contents)} VolumeSnapshotContent objects")
+            return True
+        except Exception as e:
+            print(f"[x] Error discovering VolumeSnapshotContents: {e}")
+            print("  Parentless CSI snapshots with no RBD children will be marked REVIEW instead of SAFE TO DELETE")
+            self.volume_snapshot_contents = None  # distinguish "couldn't check" from "checked, found none"
+            return False
+
     def discover_odf_guids(self) -> bool:
         """Discover all lab GUIDs from ODF RBD images"""
         print("Discovering lab GUIDs from ODF RBD images...")
@@ -188,10 +220,9 @@ class OdfOpenShiftComparator:
     def _extract_guid_from_image(self, img_name: str, source: str):
         """Extract GUID from an ODF image name"""
         try:
-            # Pattern 1: ocp4-cluster-{GUID}-{UUID}
+            # Pattern 1: {cluster-prefix}-{GUID}-{UUID}
             # Extract: {GUID}
-            volume_pattern = re.compile(r'ocp4-cluster-([a-z0-9]+)-[a-f0-9-]+')
-            match = volume_pattern.search(img_name)
+            match = VOLUME_GUID_PATTERN.search(img_name)
             
             if match:
                 guid = match.group(1)
@@ -219,7 +250,7 @@ class OdfOpenShiftComparator:
                         print(f"    Found GUID: {guid} (from CSI snap parent: {img_name})")
                     return guid
             
-            if self.debug and ('ocp4-cluster' in img_name or 'csi-snap' in img_name):
+            if self.debug and (any(p in img_name for p in CLUSTER_NAME_PREFIXES) or 'csi-snap' in img_name):
                 print(f"    Could not extract GUID from: {img_name}")
                 
         except Exception as e:
@@ -241,8 +272,7 @@ class OdfOpenShiftComparator:
                     parent_pool, parent_image = parent_info[0], parent_info[1]
                     
                     # Extract GUID from parent image name
-                    volume_pattern = re.compile(r'ocp4-cluster-([a-z0-9]+)-[a-f0-9-]+')
-                    match = volume_pattern.search(parent_image)
+                    match = VOLUME_GUID_PATTERN.search(parent_image)
                     if match:
                         guid = match.group(1)
                         
@@ -259,6 +289,38 @@ class OdfOpenShiftComparator:
         
         return guid
     
+    def _check_csi_snap_k8s_ownership(self, csi_snap_name: str) -> Dict:
+        """Match csi-snap's UUID against VSC snapshotHandles to check real ownership.
+        Returns {'checked', 'found', 'namespace', 'namespace_active', 'vsc_name'}."""
+        result = {'checked': False, 'found': False, 'namespace': None,
+                  'namespace_active': None, 'vsc_name': None}
+
+        if self.volume_snapshot_contents is None:
+            return result  # couldn't load VSCs at all - stays unchecked, caller should fail safe
+
+        result['checked'] = True
+
+        match = re.search(r'csi-snap-([a-f0-9-]+)', csi_snap_name)
+        if not match:
+            return result
+        snap_uuid = match.group(1)
+
+        for vsc in self.volume_snapshot_contents:
+            status = vsc.get('status') or {}
+            spec = vsc.get('spec') or {}
+            handle = status.get('snapshotHandle') or (spec.get('source') or {}).get('snapshotHandle') or ''
+            if snap_uuid in handle:
+                result['found'] = True
+                result['vsc_name'] = (vsc.get('metadata') or {}).get('name')
+                ref = spec.get('volumeSnapshotRef') or {}
+                namespace = ref.get('namespace')
+                result['namespace'] = namespace
+                if namespace:
+                    result['namespace_active'] = namespace in self.all_namespace_names
+                break
+
+        return result
+
     def _analyze_parentless_csi_snap(self, csi_snap_name: str):
         """Analyze a parentless CSI snapshot to find children and their GUIDs"""
         if csi_snap_name in self.parentless_csi_snaps:
@@ -271,7 +333,8 @@ class OdfOpenShiftComparator:
             'orphaned_child_guids': [],
             'total_children': 0,
             'has_active_children': False,
-            'recommendation': 'unknown'
+            'recommendation': 'unknown',
+            'k8s_check': None
         }
         
         try:
@@ -303,7 +366,33 @@ class OdfOpenShiftComparator:
                 elif analysis['orphaned_child_guids']:
                     analysis['recommendation'] = 'REVIEW - has orphaned children only'
                 elif analysis['total_children'] == 0:
-                    analysis['recommendation'] = 'SAFE TO DELETE - no children'
+                    # Zero RBD children doesn't mean zero owners - a VolumeSnapshot
+                    # can still point at this csi-snap with no clone ever having
+                    # been made from it. Verify against real k8s objects.
+                    k8s_check = self._check_csi_snap_k8s_ownership(csi_snap_name)
+                    analysis['k8s_check'] = k8s_check
+                    if not k8s_check['checked']:
+                        analysis['recommendation'] = (
+                            'REVIEW - no RBD children, but could not verify '
+                            'VolumeSnapshotContent ownership (see errors above)'
+                        )
+                    elif k8s_check['found'] and k8s_check['namespace_active']:
+                        analysis['recommendation'] = (
+                            f"KEEP - no RBD children, but still referenced by "
+                            f"VolumeSnapshotContent {k8s_check['vsc_name']} "
+                            f"in active namespace {k8s_check['namespace']}"
+                        )
+                    elif k8s_check['found']:
+                        ns_desc = k8s_check['namespace'] or 'unknown namespace'
+                        analysis['recommendation'] = (
+                            f"REVIEW - no RBD children, referenced by VolumeSnapshotContent "
+                            f"{k8s_check['vsc_name']} in orphaned namespace {ns_desc} "
+                            f"(delete the VolumeSnapshotContent too)"
+                        )
+                    else:
+                        analysis['recommendation'] = (
+                            'SAFE TO DELETE - no RBD children, no VolumeSnapshotContent reference found'
+                        )
                 else:
                     analysis['recommendation'] = 'REVIEW - children have no GUID pattern'
                 
@@ -316,8 +405,7 @@ class OdfOpenShiftComparator:
     
     def _extract_guid_from_name(self, name: str) -> Optional[str]:
         """Extract GUID from any image name using the standard pattern"""
-        volume_pattern = re.compile(r'ocp4-cluster-([a-z0-9]+)-[a-f0-9-]+')
-        match = volume_pattern.search(name)
+        match = VOLUME_GUID_PATTERN.search(name)
         return match.group(1) if match else None
     
     def compare_and_find_orphans(self):
@@ -510,7 +598,7 @@ class OdfOpenShiftComparator:
 export CL_POOL="{self.pool_name}"
 export CL_CONF="{os.environ.get('CL_CONF', '/path/to/ceph.conf')}"
 export CL_KEYRING="{os.environ.get('CL_KEYRING', '/path/to/keyring')}"
-export DRY_RUN="true"  # Change to "false" for actual cleanup
+export DRY_RUN="false"  # Change to "true" to preview without deleting
 export DEBUG="true"
 
 # Orphaned GUIDs to clean up (ordered by complexity: simple → complex)
@@ -525,61 +613,78 @@ echo "Priority 3 (volumes + snapshots + trash): $PRIORITY_3_GUIDS"
 echo "DRY_RUN: $DRY_RUN"
 echo ""
 
+if [ "$DRY_RUN" != "true" ]; then
+    echo "WARNING: DRY_RUN is false - actual deletion will occur."
+    read -p "Do you want to proceed? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+        echo "Aborted - no changes made."
+        exit 1
+    fi
+fi
+
+NEEDS_REVIEW_FILE="needs_descendant_review.txt"
+
+# Cleans up one GUID: odf-cleanup.py first; if that fails (most likely due to
+# active descendants), fall back to odf-descendant-reaper.py to remove any
+# SAFE_TO_REMOVE chains / confirmed phantom entries, then retry odf-cleanup.py.
+# Anything the reaper can't resolve (NEEDS_REVIEW, undiagnosed errors) is
+# logged to NEEDS_REVIEW_FILE instead of being touched further.
+process_guid() {{
+    local guid="$1"
+    local label="$2"
+
+    echo "=================================================="
+    echo "Cleaning up GUID: $guid ($label)"
+    echo "=================================================="
+
+    export CL_LAB="$guid"
+
+    if python3 odf-cleanup.py; then
+        echo "[v] Successfully processed GUID: $guid"
+        return
+    fi
+
+    echo "[x] Failed to process GUID: $guid (likely active descendants) - trying odf-descendant-reaper.py..."
+    if python3 odf-descendant-reaper.py; then
+        echo "[v] Reaper resolved blocking descendants for $guid - retrying cleanup..."
+        if python3 odf-cleanup.py; then
+            echo "[v] Successfully processed GUID: $guid after reaper fallback"
+        else
+            echo "[x] Still failed after reaper fallback: $guid - logged for manual review"
+            echo "$guid" >> "$NEEDS_REVIEW_FILE"
+        fi
+    else
+        echo "[x] Reaper could not fully resolve $guid (NEEDS_REVIEW or undiagnosed error) - logged for manual review"
+        echo "$guid" >> "$NEEDS_REVIEW_FILE"
+    fi
+}}
+
 # Cleanup loop - Priority 1: Volumes only (safest)
 echo "=== PRIORITY 1: Volumes only (safest) ==="
 for guid in $PRIORITY_1_GUIDS; do
-    echo "=================================================="
-    echo "Cleaning up GUID: $guid (Priority 1 - volumes only)"
-    echo "=================================================="
-    
-    export CL_LAB="$guid"
-    
-    if python3 odf-cleanup.py; then
-        echo "[v] Successfully processed GUID: $guid"
-    else
-        echo "[x] Failed to process GUID: $guid"
-    fi
-    
+    process_guid "$guid" "Priority 1 - volumes only"
     echo ""
 done
 
-# Cleanup loop - Priority 2: Volumes + snapshots  
+# Cleanup loop - Priority 2: Volumes + snapshots
 echo "=== PRIORITY 2: Volumes + snapshots ==="
 for guid in $PRIORITY_2_GUIDS; do
-    echo "=================================================="
-    echo "Cleaning up GUID: $guid (Priority 2 - volumes + snapshots)"
-    echo "=================================================="
-    
-    export CL_LAB="$guid"
-    
-    if python3 odf-cleanup.py; then
-        echo "[v] Successfully processed GUID: $guid"
-    else
-        echo "[x] Failed to process GUID: $guid"
-    fi
-    
+    process_guid "$guid" "Priority 2 - volumes + snapshots"
     echo ""
 done
 
 # Cleanup loop - Priority 3: Volumes + snapshots + trash (most complex)
 echo "=== PRIORITY 3: Volumes + snapshots + trash (most complex) ==="
 for guid in $PRIORITY_3_GUIDS; do
-    echo "=================================================="
-    echo "Cleaning up GUID: $guid (Priority 3 - volumes + snapshots + trash)"
-    echo "=================================================="
-    
-    export CL_LAB="$guid"
-    
-    if python3 odf-cleanup.py; then
-        echo "[v] Successfully processed GUID: $guid"
-    else
-        echo "[x] Failed to process GUID: $guid"
-    fi
-    
+    process_guid "$guid" "Priority 3 - volumes + snapshots + trash"
     echo ""
 done
 
 echo "Cleanup script completed!"
+if [ -f "$NEEDS_REVIEW_FILE" ]; then
+    echo ""
+    echo "$(wc -l < "$NEEDS_REVIEW_FILE") GUID(s) still need manual review - see $NEEDS_REVIEW_FILE"
+fi
 """
         
         try:
@@ -592,7 +697,10 @@ echo "Cleanup script completed!"
             print(f"[v] Cleanup script created: {output_file}")
             print(f"  Contains {len(self.orphaned_guids)} orphaned GUIDs")
             print(f"  Run with: ./{output_file}")
-            print("  WARNING: Review and test in DRY_RUN mode first!")
+            print("  WARNING: DRY_RUN defaults to false - this will actually delete.")
+            print("  It will prompt for confirmation before proceeding; set DRY_RUN=\"true\" in the script to preview first.")
+            print("  GUIDs odf-cleanup.py can't finish (active descendants) automatically fall back to")
+            print("  odf-descendant-reaper.py; anything still unresolved is logged to needs_descendant_review.txt")
             
         except Exception as e:
             print(f"[x] Error creating cleanup script: {e}")
@@ -610,7 +718,11 @@ echo "Cleanup script completed!"
             # Discover GUIDs from both sources
             if not self.discover_namespace_guids():
                 return False
-            
+
+            # Non-fatal if this fails - parentless csi-snap checks just fall
+            # back to REVIEW instead of trusting the RBD-only "no children" signal.
+            self.discover_volume_snapshot_contents()
+
             if not self.discover_odf_guids():
                 return False
             
