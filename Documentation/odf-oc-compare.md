@@ -5,7 +5,7 @@ The `odf-oc-compare.py` script compares OpenShift namespaces with ODF (OpenShift
 
 ## Execution Flow
 ```
-main() → OdfOpenShiftComparator.run_comparison() → connect_odf() → discover_namespace_guids() → discover_odf_guids() → compare_and_find_orphans() → generate_report() → generate_cleanup_script()
+main() → OdfOpenShiftComparator.run_comparison() → connect_odf() → discover_namespace_guids() → discover_volume_snapshot_contents() → discover_odf_guids() → compare_and_find_orphans() → generate_report() → generate_cleanup_script()
 ```
 
 ### High-Level Execution Flow Diagram
@@ -13,7 +13,8 @@ main() → OdfOpenShiftComparator.run_comparison() → connect_odf() → discove
 ```mermaid
 graph TD
     A["Connect to ODF Cluster"] --> B["Discover Namespace GUIDs"]
-    B --> C["Discover ODF GUIDs"]
+    B --> B2["Discover VolumeSnapshotContents (non-fatal)"]
+    B2 --> C["Discover ODF GUIDs"]
     C --> D["Compare & Find Orphans"]
     D --> E["Generate Report"]
     E --> F["Generate Cleanup Script"]
@@ -38,6 +39,7 @@ graph TD
 - `orphaned_guids` - Set of GUIDs present in ODF but not in active namespaces
 - `csi_snap_guid_cache` - Cache for CSI snapshot parent lookups
 - `parentless_csi_snaps` - Analysis of CSI snapshots without parents
+- `volume_snapshot_contents` - Cluster's `VolumeSnapshotContent` objects, used to verify real ownership of parentless csi-snaps; `None` means "couldn't load" (callers fail safe into REVIEW), `[]` means "loaded, none exist"
 
 ---
 
@@ -66,8 +68,15 @@ graph TD
 - Populates `active_namespace_guids` set
 - Updates statistics for namespace discovery
 
+#### `discover_volume_snapshot_contents()`
+**When:** After namespace discovery, before ODF discovery
+**Purpose:** Loads all `VolumeSnapshotContent` objects so parentless csi-snap ownership can be verified against real Kubernetes state instead of just RBD children
+**Does:**
+- Lists cluster-scoped `volumesnapshotcontents` via the Kubernetes `CustomObjectsApi`
+- Non-fatal on failure: sets `volume_snapshot_contents = None` so callers know to fail safe into `REVIEW` rather than silently treating it as "none exist"
+
 #### `discover_odf_guids()`
-**When:** After namespace discovery
+**When:** After VolumeSnapshotContent discovery
 **Purpose:** Discovers all lab GUIDs from ODF RBD images and snapshots
 **Does:**
 - Lists all active RBD images in the pool
@@ -81,6 +90,7 @@ graph TD
 - `_extract_guid_from_image()` - Extracts GUID from image name using regex patterns
 - `_get_guid_from_csi_snap_parent()` - Gets GUID from CSI snapshot's parent (with caching)
 - `_analyze_parentless_csi_snap()` - Analyzes CSI snapshots that have no parent
+- `_check_csi_snap_k8s_ownership()` - For a parentless csi-snap with zero RBD children, matches its UUID against loaded `VolumeSnapshotContent` `snapshotHandle`s to check whether it's still referenced (and whether that reference's namespace is active)
 - `_extract_guid_from_name()` - Generic GUID extraction utility
 
 ### Phase 3: Analysis
@@ -115,8 +125,8 @@ graph TD
 **Does:**
 - Generates executable shell script with environment setup
 - Orders GUIDs by cleanup priority (simple → complex)
-- Creates safety measures (dry-run mode, error handling)
-- Provides structured cleanup workflow
+- Defaults `DRY_RUN="false"` (live) but prompts for `y/n` confirmation before running anything
+- Per GUID, runs `odf-cleanup.py`; on failure (most likely active descendants) falls back to `odf-descendant-reaper.py` in live mode, then retries `odf-cleanup.py`; anything still unresolved is logged to `needs_descendant_review.txt` instead of being touched further
 
 ---
 
@@ -143,7 +153,8 @@ graph TD
 
 ### Discovery Capabilities
 - **Namespace Pattern Matching:** Extracts GUIDs from `sandbox-{GUID}-*` namespace patterns
-- **ODF Volume Recognition:** Identifies volumes using `ocp4-cluster-{GUID}-{UUID}` patterns
+- **ODF Volume Recognition:** Identifies volumes using `{ocp4-cluster|openshift-cluster}-{GUID}-{UUID}` patterns (current + legacy cluster-name prefixes)
+- **VolumeSnapshotContent Discovery:** Loads cluster-scoped VSCs to verify real ownership of parentless csi-snaps
 - **CSI Snapshot Handling:** Processes snapshots via parent relationships
 - **Trash Item Analysis:** Includes deleted/trashed items in discovery
 
@@ -160,8 +171,8 @@ graph TD
 
 ### Output Generation
 - **Detailed Reporting:** Comprehensive analysis with actionable recommendations
-- **Automated Scripts:** Generates ready-to-run cleanup scripts
-- **Safety Features:** Built-in dry-run and error handling
+- **Automated Scripts:** Generates ready-to-run cleanup scripts, live by default with a confirmation prompt
+- **Safety Features:** Descendant-reaper fallback per GUID, manual-review logging for anything unresolved
 - **Progress Tracking:** Statistics and status reporting throughout process
 
 ---
@@ -171,7 +182,7 @@ graph TD
 ### GUID Extraction Decision
 
 #### Decision Mechanisms:
-- **Primary Pattern:** `ocp4-cluster-{GUID}-{UUID}` for direct volume matching
+- **Primary Pattern:** follows `VOLUME_GUID_PATTERN`
 - **Secondary Pattern:** CSI snapshot parent lookup for indirect GUID discovery
 
 #### Strategy:
@@ -219,16 +230,17 @@ Complexity ordering ensures **progressive risk management** by handling simple, 
 #### Decision Mechanisms:
 - **Orphan Count Check:** Only generate script if orphans exist
 - **Environment Replication:** Use current environment variables as template
-- **Safety Integration:** Build in dry-run and error handling by default
+- **Safety Integration:** Confirmation prompt + automated fallback instead of dry-run-by-default
 
 #### Strategy:
 - **Template-Based Generation:** Create executable script with proper environment setup
-- **Error Handling:** Include success/failure tracking for each GUID
+- **Live By Default, Gated:** `DRY_RUN="false"` is the default, but the script always prompts for `y/n` confirmation before doing anything destructive
+- **Automated Fallback Per GUID:** `odf-cleanup.py` first; on failure, run `odf-descendant-reaper.py` live to clear `SAFE_TO_REMOVE` chains/phantom entries, then retry `odf-cleanup.py`
+- **Manual Review Logging:** Anything still unresolved after the fallback is appended to `needs_descendant_review.txt` instead of being retried further
 - **Progressive Execution:** Process by priority levels with clear separation
-- **Safety Defaults:** Enable dry-run mode and debug output by default
 
 #### **Key Point:**
-Script generation prioritizes **operational safety** over convenience, ensuring operators can review and test before executing actual cleanup operations.
+Script generation defaults to actually completing the cleanup (with a fallback for the most common blocker - active descendants) rather than just previewing it, but never proceeds without an explicit `y/n` confirmation, and never silently drops a GUID it couldn't resolve.
 
 ### Parentless CSI Snapshot Analysis Decision
 
@@ -236,14 +248,19 @@ Script generation prioritizes **operational safety** over convenience, ensuring 
 - **Child Discovery:** Use RBD `list_descendants()` to find children
 - **GUID Analysis:** Extract GUIDs from child names
 - **Active Status Check:** Compare child GUIDs against active namespace GUIDs
+- **Kubernetes Ownership Check:** For the zero-children case, verify against real `VolumeSnapshotContent` objects instead of trusting the RBD-only signal
 - **Recommendation Logic:** Provide action recommendations based on analysis
 
 #### Strategy:
-- **Child-Based Classification:** Determine safety based on child image activity
+- **Child-Based Classification:** Determine safety based on child image activity first
 - **KEEP Recommendation:** If any children belong to active namespaces
 - **REVIEW Recommendation:** If children exist but are orphaned
-- **DELETE Recommendation:** If no children exist
+- **Zero-Children Case Needs Verification:** Zero RBD children doesn't mean zero owners - a `VolumeSnapshot` can still reference this csi-snap with no clone ever made from it, so `_check_csi_snap_k8s_ownership()` decides the outcome:
+  - **KEEP:** a matching VolumeSnapshotContent exists and its namespace is still active
+  - **REVIEW:** a matching VolumeSnapshotContent exists but its namespace is orphaned (delete the VSC too)
+  - **REVIEW (fail-safe):** VolumeSnapshotContents couldn't be loaded at all - can't verify, so don't risk it
+  - **SAFE TO DELETE:** no RBD children and no VolumeSnapshotContent reference found
 - **ERROR Handling:** Graceful handling of analysis failures
 
 #### **Key Point:**
-Parentless snapshot analysis uses **child dependency analysis** to make safe recommendations, preventing accidental deletion of snapshots that support active workloads. 
+Parentless snapshot analysis no longer treats "zero RBD children" as sufficient grounds for deletion - it cross-checks real Kubernetes ownership first, since a snapshot can still be referenced by a live `VolumeSnapshot`/`VolumeSnapshotContent` without ever having been cloned.
