@@ -322,8 +322,10 @@ Phase 2: Scanning for missing descendants...
 - `_restore_from_trash()` - Temporarily restores trash items for deletion
 - `_flatten_image()` - Flattens images to remove parent dependencies
 - `_wait_for_flatten_completion()` - Waits for flatten operation to complete
-- `_remove_active_image()` - Removes active RBD images after dependency resolution
+- `_remove_active_image()` - Removes active RBD images after dependency resolution; refuses to delete if `_get_watchers()` finds an external watcher
 - `_remove_internal_snapshots()` - Removes and unprotects internal snapshots
+- `_get_watchers()` - Lists external watchers on an open image (excludes our own inspection watch)
+- `_check_phantom_entry()` / `_execute_phantom_cleanup()` - Detect and clean up a dangling `rbd_id` pointer whose `rbd_header` is missing (Ceph metadata corruption); used when an image can't be opened at all
 
 ### Phase 5: Recovery & Verification
 
@@ -388,6 +390,9 @@ Phase 2: Scanning for missing descendants...
 - **Dry Run Mode:** Simulates operations without actual deletion
 - **Hierarchical Deletion:** Removes children before parents
 - **Dependency Tracking:** Prevents deletion of items with active dependencies
+- **Watcher Failsafe:** `list_descendants()` only catches RBD clone children - it says nothing about whether some other client is using an image right now. Before deleting our own images, `_remove_active_image()` checks for active watchers and refuses if any are found
+- **Foreign Descendant Handling:** A discovered descendant whose name doesn't carry our own GUID belongs to a different namespace (e.g. a cross-namespace CDI/CSI clone - see [Workflow Decisions](#foreign-descendant-decision)). We never delete that data, watched or not - we only `flatten()` it to sever the dependency, so our own orphaned chain above it can still be removed
+- **Phantom Entry Cleanup:** Some images exist only as a dangling `rbd_id` pointer with no `rbd_header` (Ceph metadata corruption - `rbd.Image()` can't open them at all). These are detected during discovery and cleaned up at the `rados` level instead of being silently skipped or reported as a false failure
 - **Final Verification:** Ensures complete cleanup
 
 ### Error Handling
@@ -506,4 +511,18 @@ The retry strategy assumes that **expired trash items** may be blocking cleanup 
 
 #### **Key Point:**
 This decision prioritizes **complete hierarchy discovery** over performance. The recursive scan ensures no blocking descendants are missed, preventing "still has descendants" errors during deletion regardless of naming inconsistencies or race conditions.
+
+### Foreign Descendant Decision
+
+#### Decision Mechanisms:
+- **Ownership check:** Any descendant found during recursive discovery whose name doesn't contain our own `lab_guid` is marked `is_foreign` and never recursed into further
+- **Action:** `_remove_image()` routes foreign descendants to `_flatten_foreign_descendant()` instead of deletion, regardless of watcher state
+
+#### Strategy:
+- **Problem:** RBD clone parents can't be deleted while *any* child exists - even a legitimate clone made by a completely different, still-active namespace (e.g. OpenShift Virtualization/CDI smart-cloning a golden image across namespaces). Deleting that child would destroy someone else's live data
+- **Solution:** `rbd flatten` copies the parent's blocks into the child and severs the link, without touching the child's data or interrupting its use - so it's safe to run unconditionally, whether or not the child is currently watched
+- **Outcome:** Our own orphaned chain becomes deletable once the foreign leaf is flattened; the foreign image itself is left running exactly as before, just independent of us now
+
+#### **Key Point:**
+We only ever take ownership of images that carry our own GUID. Anything else in the chain gets decoupled, never deleted - this is why the generated cleanup script no longer needs a separate reaper fallback for this case; `odf-descendant-reaper.py` remains available as a standalone manual tool for chains that still fail (e.g. a truly ambiguous or errored-out image).
 

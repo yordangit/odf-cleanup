@@ -2,11 +2,12 @@
 """Deletes ODF objects based on a LAB GUID using a hierarchical tree approach.
 
 Author:  gh:@yordangit
-Version: 25.08.04
+Version: 26.09.18
 """
 
 import rbd
 import rados
+import struct
 import time
 import os
 from datetime import datetime
@@ -43,6 +44,11 @@ class OdfImage:
         self.needs_flattening = False
         self.restoration_reason: Optional[str] = None
         self.depends_on_trash = False
+        # Rbd_header is missing (Ceph metadata corruption), can't be opened
+        # via rbd.Image() at all, needs a rados-level cleanup instead.
+        self.phantom_image_id: Optional[str] = None
+        # cross-namespace CDI/CSI clone
+        self.is_foreign = False
     
     def add_child(self, child: 'OdfImage'):
         """Add a child image"""
@@ -174,12 +180,14 @@ class OdfCleaner:
         self.ioctx = None
         self.lab_guid = None
         self.pool_name = None
+        self.my_instance_id = None
         self.tree = OdfTree()
         self.removal_stats = {
             'images_removed': 0,
             'csi_snaps_removed': 0,
             'internal_snaps_removed': 0,
             'trash_items_removed': 0,
+            'foreign_flattened': 0,
             'failed_removals': []
         }
         # Cache for dependency analysis (active parent->trash child)
@@ -214,6 +222,9 @@ class OdfCleaner:
             self.cluster = rados.Rados(conffile=conf_file, conf=dict(keyring=keyring), name=client_name)
             self.cluster.connect()
             self.ioctx = self.cluster.open_ioctx(self.pool_name)
+            # Needed to filter our own watch out of watcher checks - opening
+            # an image to inspect it registers a watch too.
+            self.my_instance_id = self.cluster.get_instance_id()
             
             if self.debug:
                 print(f"Connected to ODF cluster: {self.cluster.get_fsid()}")
@@ -397,7 +408,12 @@ class OdfCleaner:
                                 new_image = self._create_image_from_rbd(desc_name, desc_image_type)
                                 if new_image:
                                     new_image.parent_name = image.name
-                                    current_batch.append(new_image)
+                                    new_image.is_foreign = self.lab_guid not in desc_name
+                                    # Foreign descendants get flattened and never recursed into
+                                    if not new_image.is_foreign:
+                                        current_batch.append(new_image)
+                                    else:
+                                        print(f"    Found foreign descendant (outside our GUID, will flatten not delete): {desc_name}")
                                     all_additional.append(new_image)
                                     discovered_names.add(desc_name)
                                     image_lookup[desc_name] = new_image
@@ -496,9 +512,51 @@ class OdfCleaner:
                 return image
                 
         except Exception as e:
+            phantom_id = self._check_phantom_entry(img_name)
+            if phantom_id:
+                print(f"  PHANTOM ENTRY detected: {img_name} (rbd_id -> id={phantom_id}, but rbd_header.{phantom_id} is missing)")
+                image = OdfImage(name=img_name, image_type=image_type)
+                image.phantom_image_id = phantom_id
+                return image
             print(f"Error creating image for {img_name}: {e}")
             return None
-    
+
+    def _check_phantom_entry(self, image_name: str) -> Optional[str]:
+        """Detect a known corruption pattern: rbd_id.<name> exists and resolves
+        to an internal id, but that id's rbd_header object is missing."""
+        id_obj = f"rbd_id.{image_name}"
+        try:
+            self.ioctx.stat(id_obj)
+        except Exception:
+            return None  # no id pointer either
+        try:
+            raw = self.ioctx.read(id_obj, length=4096)
+            length = struct.unpack('<I', raw[:4])[0]
+            image_id = raw[4:4 + length].decode('utf-8', errors='replace')
+        except Exception:
+            return None
+        try:
+            self.ioctx.stat(f"rbd_header.{image_id}")
+            return None  # header exists
+        except Exception:
+            return image_id
+
+    def _execute_phantom_cleanup(self, image_name: str, image_id: str) -> bool:
+        """Remove a confirmed phantom rbd_id pointer and omap keys.
+        Never touches rbd_header (already gone)."""
+        id_obj = f"rbd_id.{image_name}"
+        try:
+            write_op = self.ioctx.create_write_op()
+            self.ioctx.remove_omap_keys(write_op, (f"name_{image_name}", f"id_{image_id}"))
+            self.ioctx.operate_write_op(write_op, "rbd_directory")
+            write_op.release()
+            self.ioctx.remove_object(id_obj)
+            print(f"    Successfully deleted: {image_name} (phantom entry, id={image_id})")
+            return True
+        except Exception as e:
+            print(f"    ERROR: Failed to clean up phantom entry {image_name}: {e}")
+            return False
+
     def _create_trash_image(self, trash_item: dict, image_type: ImageType) -> Optional[OdfImage]:
         """Create an OdfImage from a trash item"""
         try:
@@ -557,7 +615,7 @@ class OdfCleaner:
         
         print("Planned removal order:")
         for i, image in enumerate(removal_order, 1):
-            status = "TRASH" if image.in_trash else "ACTIVE"
+            status = "FOREIGN-FLATTEN-ONLY" if image.is_foreign else ("TRASH" if image.in_trash else "ACTIVE")
             print(f"  {i:2d}. {image.name} ({image.image_type.value}) [{status}]")
         
         return removal_order
@@ -573,6 +631,12 @@ class OdfCleaner:
             
             for i, image in enumerate(removal_order, 1):
                 print(f"\n[{i}/{len(removal_order)}] Processing: {image.name}")
+                if image.phantom_image_id:
+                    print(f"  DRY RUN: Would clean up phantom entry (dangling rbd_id pointer, id={image.phantom_image_id})")
+                    continue
+                if image.is_foreign:
+                    print(f"  DRY RUN: Would flatten only (foreign - outside our GUID, data left intact)")
+                    continue
                 print(f"  DRY RUN: Would remove {image.image_type.value}")
                 if image.internal_snaps:
                     print(f"  DRY RUN: Would remove {len(image.internal_snaps)} internal snapshots")
@@ -676,8 +740,12 @@ class OdfCleaner:
             # Attempt removal
             success = self._remove_image(image)
             if success:
-                self._update_removal_stats(image)
-                print(f"  SUCCESS: Removed {image.name}")
+                if image.is_foreign:
+                    self.removal_stats['foreign_flattened'] += 1
+                    print(f"  SUCCESS: Flattened {image.name} (foreign - data left intact)")
+                else:
+                    self._update_removal_stats(image)
+                    print(f"  SUCCESS: Removed {image.name}")
             else:
                 # Only add to failed_removals if not already there
                 if image.name not in self.removal_stats['failed_removals']:
@@ -759,7 +827,14 @@ class OdfCleaner:
     def _remove_image(self, image: OdfImage) -> bool:
         """Remove a single RBD image with proper handling"""
         print(f"  Removing {image.image_type.value}: {image.name}")
-        
+
+        # Never delete data outside our own GUID, only flatten it to sever the dependency.
+        if image.is_foreign:
+            return self._flatten_foreign_descendant(image)
+
+        if image.phantom_image_id:
+            return self._execute_phantom_cleanup(image.name, image.phantom_image_id)
+
         try:
             # Handle trash items first - restore them temporarily
             if image.in_trash:
@@ -827,6 +902,11 @@ class OdfCleaner:
             print(f"    ERROR: Failed to flatten {image.name}: {e}")
             return False
     
+    def _flatten_foreign_descendant(self, image: OdfImage) -> bool:
+        """Foreign descendants are only flattened to sever the dependency."""
+        print(f"    Foreign descendant, flattening: {image.name}")
+        return self._flatten_image(image)
+
     def _wait_for_flatten_completion(self, img, img_name: str, max_wait: int = 300):
         """Wait for flatten operation to complete"""
         print(f"    Waiting for flatten completion...")
@@ -850,10 +930,42 @@ class OdfCleaner:
         print(f"    WARNING: Flatten may still be in progress after {max_wait}s")
         return True  # Continue anyway
     
+    # Name varies by packaging: docs say list_watchers(), RHEL9's
+    # python3-rbd 18.2.8 exposes watchers_list() instead. Try both.
+    WATCHER_METHOD_NAMES = ('list_watchers', 'watchers_list')
+
+    def _get_watchers(self, img, image_name: str) -> List[str]:
+        """List external watchers on an open image (excludes our own watch,
+        which opening the image to inspect it registers)."""
+        for method_name in self.WATCHER_METHOD_NAMES:
+            method = getattr(img, method_name, None)
+            if method is None:
+                continue
+            raw_watchers = list(method())
+            external = [
+                w for w in raw_watchers
+                if not (isinstance(w, dict) and w.get('id') == self.my_instance_id)
+            ]
+            return [str(w) for w in external]
+        raise RuntimeError(f"none of {self.WATCHER_METHOD_NAMES} found on rbd.Image "
+                            f"for {image_name} - unknown Ceph client binding")
+
     def _remove_active_image(self, image: OdfImage) -> bool:
         """Remove an active RBD image (volumes, csi-snaps)"""
         try:
             with rbd.Image(self.ioctx, image.name) as img:
+                # Watcher failsafe: list_descendants() only catches RBD clone
+                # children. Refuse to delete anything that's currently watched.
+                try:
+                    watchers = self._get_watchers(img, image.name)
+                except Exception as e:
+                    print(f"    ERROR: Could not check watchers for {image.name}: {e} - refusing to delete")
+                    return False
+                if watchers:
+                    print(f"    ERROR: Image {image.name} has {len(watchers)} active watcher(s) - refusing to delete")
+                    print(f"    Watchers: {watchers}")
+                    return False
+
                 # Get current state
                 descendants = list(img.list_descendants())
                 active_descendants = [d for d in descendants if not d.get('trash', False)]
@@ -955,6 +1067,7 @@ class OdfCleaner:
         print(f"CSI-snaps removed: {self.removal_stats['csi_snaps_removed']}")
         print(f"Internal snaps removed: {self.removal_stats['internal_snaps_removed']}")
         print(f"Trash items removed: {self.removal_stats['trash_items_removed']}")
+        print(f"Foreign descendants flattened (not deleted): {self.removal_stats['foreign_flattened']}")
         print(f"Failed removals: {len(self.removal_stats['failed_removals'])}")
         print(f"Failed trash restorations: {len(self._failed_trash_restorations)}")
         

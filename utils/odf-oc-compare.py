@@ -624,11 +624,11 @@ fi
 
 NEEDS_REVIEW_FILE="needs_descendant_review.txt"
 
-# Cleans up one GUID: odf-cleanup.py first; if that fails (most likely due to
-# active descendants), fall back to odf-descendant-reaper.py to remove any
-# SAFE_TO_REMOVE chains / confirmed phantom entries, then retry odf-cleanup.py.
-# Anything the reaper can't resolve (NEEDS_REVIEW, undiagnosed errors) is
-# logged to NEEDS_REVIEW_FILE instead of being touched further.
+# odf-cleanup.py now handles the full lifecycle itself: watcher checks,
+# phantom entry cleanup, and flattening foreign (cross-namespace) descendants
+# instead of deleting them. A failure here means something genuinely needs a
+# human look (e.g. a watched descendant that IS part of this GUID) - run
+# odf-descendant-reaper.py manually against the GUID to investigate.
 process_guid() {{
     local guid="$1"
     local label="$2"
@@ -641,20 +641,8 @@ process_guid() {{
 
     if python3 odf-cleanup.py; then
         echo "[v] Successfully processed GUID: $guid"
-        return
-    fi
-
-    echo "[x] Failed to process GUID: $guid (likely active descendants) - trying odf-descendant-reaper.py..."
-    if python3 odf-descendant-reaper.py; then
-        echo "[v] Reaper resolved blocking descendants for $guid - retrying cleanup..."
-        if python3 odf-cleanup.py; then
-            echo "[v] Successfully processed GUID: $guid after reaper fallback"
-        else
-            echo "[x] Still failed after reaper fallback: $guid - logged for manual review"
-            echo "$guid" >> "$NEEDS_REVIEW_FILE"
-        fi
     else
-        echo "[x] Reaper could not fully resolve $guid (NEEDS_REVIEW or undiagnosed error) - logged for manual review"
+        echo "[x] Failed to process GUID: $guid - logged for manual review (try: CL_LAB=$guid python3 odf-descendant-reaper.py)"
         echo "$guid" >> "$NEEDS_REVIEW_FILE"
     fi
 }}
@@ -699,8 +687,8 @@ fi
             print(f"  Run with: ./{output_file}")
             print("  WARNING: DRY_RUN defaults to false - this will actually delete.")
             print("  It will prompt for confirmation before proceeding; set DRY_RUN=\"true\" in the script to preview first.")
-            print("  GUIDs odf-cleanup.py can't finish (active descendants) automatically fall back to")
-            print("  odf-descendant-reaper.py; anything still unresolved is logged to needs_descendant_review.txt")
+            print("  Any GUID odf-cleanup.py can't finish is logged to needs_descendant_review.txt -")
+            print("  investigate those manually with: CL_LAB=<guid> python3 odf-descendant-reaper.py")
             
         except Exception as e:
             print(f"[x] Error creating cleanup script: {e}")

@@ -126,7 +126,7 @@ graph TD
 - Generates executable shell script with environment setup
 - Orders GUIDs by cleanup priority (simple → complex)
 - Defaults `DRY_RUN="false"` (live) but prompts for `y/n` confirmation before running anything
-- Per GUID, runs `odf-cleanup.py`; on failure (most likely active descendants) falls back to `odf-descendant-reaper.py` in live mode, then retries `odf-cleanup.py`; anything still unresolved is logged to `needs_descendant_review.txt` instead of being touched further
+- Per GUID, runs `odf-cleanup.py` (which now self-handles watcher checks, phantom entries, and flattening foreign/cross-namespace descendants); on failure it's logged to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py` instead of being retried automatically
 
 ---
 
@@ -172,7 +172,7 @@ graph TD
 ### Output Generation
 - **Detailed Reporting:** Comprehensive analysis with actionable recommendations
 - **Automated Scripts:** Generates ready-to-run cleanup scripts, live by default with a confirmation prompt
-- **Safety Features:** Descendant-reaper fallback per GUID, manual-review logging for anything unresolved
+- **Safety Features:** `odf-cleanup.py` self-handles watchers/phantoms/foreign descendants; manual-review logging for anything it still can't resolve
 - **Progress Tracking:** Statistics and status reporting throughout process
 
 ---
@@ -230,17 +230,17 @@ Complexity ordering ensures **progressive risk management** by handling simple, 
 #### Decision Mechanisms:
 - **Orphan Count Check:** Only generate script if orphans exist
 - **Environment Replication:** Use current environment variables as template
-- **Safety Integration:** Confirmation prompt + automated fallback instead of dry-run-by-default
+- **Safety Integration:** Confirmation prompt before doing anything destructive
 
 #### Strategy:
 - **Template-Based Generation:** Create executable script with proper environment setup
 - **Live By Default, Gated:** `DRY_RUN="false"` is the default, but the script always prompts for `y/n` confirmation before doing anything destructive
-- **Automated Fallback Per GUID:** `odf-cleanup.py` first; on failure, run `odf-descendant-reaper.py` live to clear `SAFE_TO_REMOVE` chains/phantom entries, then retry `odf-cleanup.py`
-- **Manual Review Logging:** Anything still unresolved after the fallback is appended to `needs_descendant_review.txt` instead of being retried further
+- **Single Tool Per GUID:** Just runs `odf-cleanup.py` - it now handles watcher checks, phantom entry cleanup, and flattening foreign (cross-namespace) descendants itself, so no separate fallback tool is invoked automatically
+- **Manual Review Logging:** Any GUID `odf-cleanup.py` can't resolve is appended to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py`, instead of being retried automatically
 - **Progressive Execution:** Process by priority levels with clear separation
 
 #### **Key Point:**
-Script generation defaults to actually completing the cleanup (with a fallback for the most common blocker - active descendants) rather than just previewing it, but never proceeds without an explicit `y/n` confirmation, and never silently drops a GUID it couldn't resolve.
+Script generation defaults to actually completing the cleanup rather than just previewing it, but never proceeds without an explicit `y/n` confirmation, and never silently drops a GUID it couldn't resolve. `odf-descendant-reaper.py` is intentionally kept out of the automated path now - it remains a standalone manual diagnostic tool for the cases `odf-cleanup.py` genuinely can't resolve on its own (e.g. a watched descendant that IS part of the target GUID).
 
 ### Parentless CSI Snapshot Analysis Decision
 
