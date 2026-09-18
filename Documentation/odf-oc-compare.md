@@ -126,7 +126,7 @@ graph TD
 - Generates executable shell script with environment setup
 - Orders GUIDs by cleanup priority (simple → complex)
 - Defaults `DRY_RUN="false"` (live) but prompts for `y/n` confirmation before running anything
-- Per GUID, runs `odf-cleanup.py` (which now self-handles watcher checks, phantom entries, and flattening foreign/cross-namespace descendants); on failure it's logged to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py` instead of being retried automatically
+- Per GUID, runs `odf-cleanup.py` (which now self-handles watcher checks and phantom entries); on failure it's logged to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py` instead of being retried automatically
 
 ---
 
@@ -172,7 +172,7 @@ graph TD
 ### Output Generation
 - **Detailed Reporting:** Comprehensive analysis with actionable recommendations
 - **Automated Scripts:** Generates ready-to-run cleanup scripts, live by default with a confirmation prompt
-- **Safety Features:** `odf-cleanup.py` self-handles watchers/phantoms/foreign descendants; manual-review logging for anything it still can't resolve
+- **Safety Features:** `odf-cleanup.py` self-handles watchers/phantoms; manual-review logging for anything it still can't resolve
 - **Progress Tracking:** Statistics and status reporting throughout process
 
 ---
@@ -235,7 +235,7 @@ Complexity ordering ensures **progressive risk management** by handling simple, 
 #### Strategy:
 - **Template-Based Generation:** Create executable script with proper environment setup
 - **Live By Default, Gated:** `DRY_RUN="false"` is the default, but the script always prompts for `y/n` confirmation before doing anything destructive
-- **Single Tool Per GUID:** Just runs `odf-cleanup.py` - it now handles watcher checks, phantom entry cleanup, and flattening foreign (cross-namespace) descendants itself, so no separate fallback tool is invoked automatically
+- **Single Tool Per GUID:** Just runs `odf-cleanup.py` - it now handles watcher checks and phantom entry cleanup itself, so no separate fallback tool is invoked automatically
 - **Manual Review Logging:** Any GUID `odf-cleanup.py` can't resolve is appended to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py`, instead of being retried automatically
 - **Progressive Execution:** Process by priority levels with clear separation
 

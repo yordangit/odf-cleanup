@@ -47,8 +47,6 @@ class OdfImage:
         # Rbd_header is missing (Ceph metadata corruption), can't be opened
         # via rbd.Image() at all, needs a rados-level cleanup instead.
         self.phantom_image_id: Optional[str] = None
-        # cross-namespace CDI/CSI clone
-        self.is_foreign = False
     
     def add_child(self, child: 'OdfImage'):
         """Add a child image"""
@@ -187,7 +185,6 @@ class OdfCleaner:
             'csi_snaps_removed': 0,
             'internal_snaps_removed': 0,
             'trash_items_removed': 0,
-            'foreign_flattened': 0,
             'failed_removals': []
         }
         # Cache for dependency analysis (active parent->trash child)
@@ -408,12 +405,11 @@ class OdfCleaner:
                                 new_image = self._create_image_from_rbd(desc_name, desc_image_type)
                                 if new_image:
                                     new_image.parent_name = image.name
-                                    new_image.is_foreign = self.lab_guid not in desc_name
-                                    # Foreign descendants get flattened and never recursed into
-                                    if not new_image.is_foreign:
-                                        current_batch.append(new_image)
-                                    else:
-                                        print(f"    Found foreign descendant (outside our GUID, will flatten not delete): {desc_name}")
+                                    # RBD clone lineage from our own volume is proof of
+                                    # ownership - CSI-generated names never carry the GUID
+                                    # regardless of which lab they belong to, so no name
+                                    # check is needed here. Recurse and delete normally.
+                                    current_batch.append(new_image)
                                     all_additional.append(new_image)
                                     discovered_names.add(desc_name)
                                     image_lookup[desc_name] = new_image
@@ -615,7 +611,7 @@ class OdfCleaner:
         
         print("Planned removal order:")
         for i, image in enumerate(removal_order, 1):
-            status = "FOREIGN-FLATTEN-ONLY" if image.is_foreign else ("TRASH" if image.in_trash else "ACTIVE")
+            status = "TRASH" if image.in_trash else "ACTIVE"
             print(f"  {i:2d}. {image.name} ({image.image_type.value}) [{status}]")
         
         return removal_order
@@ -633,9 +629,6 @@ class OdfCleaner:
                 print(f"\n[{i}/{len(removal_order)}] Processing: {image.name}")
                 if image.phantom_image_id:
                     print(f"  DRY RUN: Would clean up phantom entry (dangling rbd_id pointer, id={image.phantom_image_id})")
-                    continue
-                if image.is_foreign:
-                    print(f"  DRY RUN: Would flatten only (foreign - outside our GUID, data left intact)")
                     continue
                 print(f"  DRY RUN: Would remove {image.image_type.value}")
                 if image.internal_snaps:
@@ -740,12 +733,8 @@ class OdfCleaner:
             # Attempt removal
             success = self._remove_image(image)
             if success:
-                if image.is_foreign:
-                    self.removal_stats['foreign_flattened'] += 1
-                    print(f"  SUCCESS: Flattened {image.name} (foreign - data left intact)")
-                else:
-                    self._update_removal_stats(image)
-                    print(f"  SUCCESS: Removed {image.name}")
+                self._update_removal_stats(image)
+                print(f"  SUCCESS: Removed {image.name}")
             else:
                 # Only add to failed_removals if not already there
                 if image.name not in self.removal_stats['failed_removals']:
@@ -828,10 +817,6 @@ class OdfCleaner:
         """Remove a single RBD image with proper handling"""
         print(f"  Removing {image.image_type.value}: {image.name}")
 
-        # Never delete data outside our own GUID, only flatten it to sever the dependency.
-        if image.is_foreign:
-            return self._flatten_foreign_descendant(image)
-
         if image.phantom_image_id:
             return self._execute_phantom_cleanup(image.name, image.phantom_image_id)
 
@@ -902,11 +887,6 @@ class OdfCleaner:
             print(f"    ERROR: Failed to flatten {image.name}: {e}")
             return False
     
-    def _flatten_foreign_descendant(self, image: OdfImage) -> bool:
-        """Foreign descendants are only flattened to sever the dependency."""
-        print(f"    Foreign descendant, flattening: {image.name}")
-        return self._flatten_image(image)
-
     def _wait_for_flatten_completion(self, img, img_name: str, max_wait: int = 300):
         """Wait for flatten operation to complete"""
         print(f"    Waiting for flatten completion...")
@@ -1067,7 +1047,6 @@ class OdfCleaner:
         print(f"CSI-snaps removed: {self.removal_stats['csi_snaps_removed']}")
         print(f"Internal snaps removed: {self.removal_stats['internal_snaps_removed']}")
         print(f"Trash items removed: {self.removal_stats['trash_items_removed']}")
-        print(f"Foreign descendants flattened (not deleted): {self.removal_stats['foreign_flattened']}")
         print(f"Failed removals: {len(self.removal_stats['failed_removals'])}")
         print(f"Failed trash restorations: {len(self._failed_trash_restorations)}")
         
