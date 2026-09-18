@@ -136,6 +136,7 @@ graph TD
 - Generates executable shell script with environment setup
 - Orders GUIDs by cleanup priority (simple → complex)
 - Defaults `DRY_RUN="false"` (live) but prompts for `y/n` confirmation before running anything
+- Auto-detects `odf-cleanup.py` and `odf-descendant-reaper.py` at either `./` or `../`/`utils/` so the generated script works whether it's run from the repo root or from `utils/` - no need to copy/move files
 - Per GUID, runs `odf-cleanup.py` (which now self-handles watcher checks and phantom entries); on failure it's logged to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py` instead of being retried automatically
 - Appends a section that writes every parentless csi-snap/csi-vol name marked `SAFE TO DELETE` to a file and runs `odf-descendant-reaper.py` in its `CL_CLEANUP_LIST` mode against it (these have no GUID, so `odf-cleanup.py` can't touch them); omitted entirely if there are none
 - Script is generated even with zero orphaned GUIDs, as long as there's at least one safe CSI leftover to clean up

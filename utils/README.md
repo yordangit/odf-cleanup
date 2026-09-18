@@ -47,6 +47,8 @@ source env.sh
 python3 utils/odf-oc-compare.py
 ```
 
+Can also be run from inside `utils/` directly (`cd utils && python3 odf-oc-compare.py`) - the generated cleanup script auto-detects the right relative path to `odf-cleanup.py` either way.
+
 
 ### Output
 

@@ -800,7 +800,7 @@ cat > "$CSI_LEFTOVERS_FILE" <<'CSILIST'
 CSILIST
 unset CL_LAB CL_VOLUME
 export CL_CLEANUP_LIST="$CSI_LEFTOVERS_FILE"
-python3 utils/odf-descendant-reaper.py
+python3 "$ODF_REAPER"
 echo ""
 '''
         
@@ -815,6 +815,26 @@ export CL_CONF="{os.environ.get('CL_CONF', '/path/to/ceph.conf')}"
 export CL_KEYRING="{os.environ.get('CL_KEYRING', '/path/to/keyring')}"
 export DRY_RUN="false"  # Change to "true" to preview without deleting
 export DEBUG="true"
+
+# Locate the other tools regardless of whether this script is run from the
+# repo root or from utils/ - avoids needing to copy/move files around.
+if [ -f "odf-cleanup.py" ]; then
+    ODF_CLEANUP="odf-cleanup.py"
+elif [ -f "../odf-cleanup.py" ]; then
+    ODF_CLEANUP="../odf-cleanup.py"
+else
+    echo "[x] Error: could not locate odf-cleanup.py (checked ./ and ../)" >&2
+    exit 1
+fi
+
+if [ -f "odf-descendant-reaper.py" ]; then
+    ODF_REAPER="odf-descendant-reaper.py"
+elif [ -f "utils/odf-descendant-reaper.py" ]; then
+    ODF_REAPER="utils/odf-descendant-reaper.py"
+else
+    echo "[x] Error: could not locate odf-descendant-reaper.py (checked ./ and utils/)" >&2
+    exit 1
+fi
 
 # Orphaned GUIDs to clean up (ordered by complexity: simple → complex)
 PRIORITY_1_GUIDS="{' '.join(priority_1_guids)}"
@@ -850,10 +870,10 @@ process_guid() {{
 
     export CL_LAB="$guid"
 
-    if python3 odf-cleanup.py; then
+    if python3 "$ODF_CLEANUP"; then
         echo "[v] Successfully processed GUID: $guid"
     else
-        echo "[x] Failed to process GUID: $guid - logged for manual review (try: CL_LAB=$guid python3 odf-descendant-reaper.py)"
+        echo "[x] Failed to process GUID: $guid - logged for manual review (try: CL_LAB=$guid python3 $ODF_REAPER)"
         echo "$guid" >> "$NEEDS_REVIEW_FILE"
     fi
 }}
