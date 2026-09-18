@@ -838,12 +838,8 @@ if [ "$DRY_RUN" != "true" ]; then
 fi
 
 NEEDS_REVIEW_FILE="needs_descendant_review.txt"
+rm -f "$NEEDS_REVIEW_FILE"  # start fresh each run - don't accumulate GUIDs across runs
 
-# odf-cleanup.py now handles the full lifecycle itself: watcher checks,
-# phantom entry cleanup, and flattening foreign (cross-namespace) descendants
-# instead of deleting them. A failure here means something genuinely needs a
-# human look (e.g. a watched descendant that IS part of this GUID) - run
-# odf-descendant-reaper.py manually against the GUID to investigate.
 process_guid() {{
     local guid="$1"
     local label="$2"
