@@ -324,6 +324,7 @@ Phase 2: Scanning for missing descendants...
 - `_wait_for_flatten_completion()` - Waits for flatten operation to complete
 - `_remove_active_image()` - Removes active RBD images after dependency resolution; refuses to delete if `_get_watchers()` finds an external watcher
 - `_remove_internal_snapshots()` - Removes and unprotects internal snapshots; a snap in RBD's trash namespace (`'trash' in snap`) is only reachable by id, so it's removed via `remove_snap_by_id()` instead of the name-based `remove_snap()`
+- `_direct_children_trash_safe()` - Fallback used in `_discover_descendants_and_dependencies()` when `list_descendants()` fails outright because a snapshot is in RBD's trash namespace; rebuilds one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (the caller's own BFS loop handles further recursion)
 - `_get_watchers()` - Lists external watchers on an open image (excludes our own inspection watch)
 - `_check_phantom_entry()` / `_execute_phantom_cleanup()` - Detect and clean up a dangling `rbd_id` pointer whose `rbd_header` is missing (Ceph metadata corruption); used when an image can't be opened at all
 
@@ -393,6 +394,7 @@ Phase 2: Scanning for missing descendants...
 - **Watcher Failsafe:** `list_descendants()` only catches RBD clone children - it says nothing about whether some other client is using an image right now. Before deleting our own images, `_remove_active_image()` checks for active watchers and refuses if any are found
 - **Phantom Entry Cleanup:** Some images exist only as a dangling `rbd_id` pointer with no `rbd_header` (Ceph metadata corruption - `rbd.Image()` can't open them at all). These are detected during discovery and cleaned up at the `rados` level instead of being silently skipped or reported as a false failure
 - **Trashed Snapshot Cleanup:** RBD's "clone v2" moves a deleted snapshot with live clones into a trash namespace instead of blocking the delete - confirmed against real cluster output that it's then unreachable by name at all (even `rbd snap rm --force` fails), only by id via `remove_snap_by_id()`
+- **Trash-Safe Descendant Discovery:** A trashed snapshot can still have a live clone child (that's exactly why it hasn't been purged yet) - but `list_descendants()` fails outright the moment any snapshot on an image is in the trash namespace, silently skipping that image's real children. `_direct_children_trash_safe()` is used as a fallback so this failure mode doesn't hide an active descendant
 - **Final Verification:** Ensures complete cleanup
 
 ### Error Handling

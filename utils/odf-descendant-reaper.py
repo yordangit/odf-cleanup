@@ -328,12 +328,66 @@ class DescendantReaper:
                 reasons.append(f"{node.name}: chain exceeds MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH}, stopped resolving")
         return "; ".join(reasons) if reasons else "unknown"
 
+    def _direct_children_trash_safe(self, img) -> List[Dict]:
+        """One level of children via set_snap()/set_snap_by_id() per snapshot +
+        list_children2() - works even when a snapshot is in RBD's trash
+        namespace, which makes list_descendants() fail outright (confirmed
+        against real cluster output: a trashed snap can still have a live
+        child, which is exactly why it's still sitting there)."""
+        children = []
+        for snap in img.list_snaps():
+            try:
+                if 'trash' in snap:
+                    img.set_snap_by_id(snap['id'])
+                else:
+                    img.set_snap(snap['name'])
+            except Exception:
+                continue
+            try:
+                children.extend(img.list_children2())
+            except AttributeError:
+                children.extend({'image': c[1], 'trash': False} for c in img.list_children())
+            except Exception:
+                pass
+            finally:
+                try:
+                    img.set_snap(None)
+                except Exception:
+                    pass
+        return children
+
+    def _walk_descendants_trash_safe(self, root_name: str) -> List[Dict]:
+        """Recursive fallback for list_descendants() - only used when it fails
+        outright. list_children2() is single-level, so this does its own BFS."""
+        all_children = []
+        seen = set()
+        queue = [root_name]
+        while queue:
+            name = queue.pop(0)
+            try:
+                with rbd.Image(self.ioctx, name) as img:
+                    direct = self._direct_children_trash_safe(img)
+            except Exception:
+                continue
+            for c in direct:
+                child_name = c.get('image') or c.get('name')
+                if not child_name or child_name in seen:
+                    continue
+                seen.add(child_name)
+                if not c.get('trash', False):
+                    all_children.append(c)
+                    queue.append(child_name)
+        return all_children
+
     def analyze_volume(self, volume_name: str) -> (List[ChainNode], Optional[str], Optional[str]):
         """Returns (roots, error, phantom_image_id). error != None means the
         volume couldn't be opened - not the same as "zero descendants"."""
         try:
             with rbd.Image(self.ioctx, volume_name) as img:
-                flat = [d for d in img.list_descendants() if not d.get('trash', False)]
+                try:
+                    flat = [d for d in img.list_descendants() if not d.get('trash', False)]
+                except Exception:
+                    flat = self._walk_descendants_trash_safe(volume_name)
         except Exception as e:
             error = f"could not read descendants of {volume_name}: {e}"
             phantom_id = self._check_phantom_entry(volume_name)

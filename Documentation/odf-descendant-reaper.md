@@ -85,10 +85,15 @@ graph TD
 **Purpose:** Returns `(roots, error, phantom_image_id)`
 **Does:**
 - Calls `list_descendants()` once on the volume - already the full recursive set, no repeated calls
+- If that fails (confirmed cause: any snapshot on the image being in RBD's trash namespace makes `list_descendants()` fail outright, even though a trashed snap can still have a live child), falls back to `_walk_descendants_trash_safe()`
 - For every descendant, calls `_inspect_node()` (watchers/timestamps/snapshots) and `_get_parent_name()`
 - Rebuilds the real parent→child tree locally instead of treating every descendant as an independent root
 - `error` is set when the volume/its descendants couldn't even be read - explicitly **not** the same as "genuinely has zero descendants", and never reported as a clean orphan
 - Nodes past `MAX_CHAIN_DEPTH` are flagged `truncated` instead of guessed at
+
+#### `_direct_children_trash_safe()` / `_walk_descendants_trash_safe()`
+**When:** `list_descendants()` fails outright (trash-namespace snapshot on the image)
+**Does:** `_direct_children_trash_safe()` gets one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (trash-namespace snaps are only reachable by id); `_walk_descendants_trash_safe()` repeats this recursively since `list_children2()` is single-level, unlike `list_descendants()`
 
 #### `_inspect_node()`
 **Does:**

@@ -351,6 +351,32 @@ class OdfCleaner:
         
         return csi_snaps
     
+    def _direct_children_trash_safe(self, img) -> List[Dict]:
+        """One level of children via set_snap()/set_snap_by_id() per snapshot +
+        list_children2(), works when a snapshot is in RBD's trash namespace,
+        which makes list_descendants() fail"""
+        children = []
+        for snap in img.list_snaps():
+            try:
+                if 'trash' in snap:
+                    img.set_snap_by_id(snap['id'])
+                else:
+                    img.set_snap(snap['name'])
+            except Exception:
+                continue
+            try:
+                children.extend(img.list_children2())
+            except AttributeError:
+                children.extend({'image': c[1], 'trash': False} for c in img.list_children())
+            except Exception:
+                pass
+            finally:
+                try:
+                    img.set_snap(None)
+                except Exception:
+                    pass
+        return children
+
     def _discover_descendants_and_dependencies(self, discovered_images: List[OdfImage]) -> Tuple[List[OdfImage], Dict[str, List[str]]]:
         """Recursively scan for missing descendants and track trash dependencies"""
         all_additional = []
@@ -375,7 +401,10 @@ class OdfCleaner:
                 
                 try:
                     with rbd.Image(self.ioctx, image.name) as img:
-                        descendants = list(img.list_descendants())
+                        try:
+                            descendants = list(img.list_descendants())
+                        except Exception:
+                            descendants = self._direct_children_trash_safe(img)
                         
                         for desc in descendants:
                             if isinstance(desc, dict):
