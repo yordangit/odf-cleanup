@@ -15,7 +15,7 @@ Requirements:
 - ODF cluster credentials (CL_CONF, CL_KEYRING environment variables)
 
 Author:  gh:@yordangit
-Version: 26.09.17
+Version: 26.09.18
 """
 
 import rbd

@@ -46,7 +46,7 @@ graph TD
 **Purpose:** One image in a descendant chain rooted at an orphaned volume.
 
 **Key Properties:**
-- `watchers`, `children`, `snapshots` - discovered state for this node
+- `watchers`, `children`, `snapshots` - discovered state for this node (each snapshot dict includes `is_trash` - RBD's "clone v2" moves a deleted snapshot with live clones into a trash namespace instead of blocking the delete; it's only removable by id via `remove_snap_by_id()`, not by name - confirmed against real cluster output that even `rbd snap rm --force` can't reach it)
 - `create_timestamp` / `access_timestamp` / `modify_timestamp` - handles either a `datetime` or raw epoch return, depending on Ceph client binding version
 - `error` - set if the image couldn't be opened/inspected
 - `truncated` - set if this node is past `MAX_CHAIN_DEPTH`
@@ -117,7 +117,7 @@ graph TD
 
 #### `_execute_chain_removal()`
 **When:** `execute=True` and a chain is `SAFE_TO_REMOVE`
-**Does:** Leaf-first: unprotects + removes every snapshot, then removes each image, directly via the RBD Python bindings - stops at the first failure rather than partially completing and reporting success
+**Does:** Leaf-first: unprotects + removes every snapshot (trashed ones via `remove_snap_by_id()`, others via `remove_snap()`), then removes each image, directly via the RBD Python bindings - stops at the first failure rather than partially completing and reporting success
 
 #### `_execute_phantom_cleanup()`
 **When:** `execute=True` and `_check_phantom_entry()` confirmed a phantom

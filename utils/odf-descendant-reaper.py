@@ -18,7 +18,7 @@ Usage:
     python3 utils/odf-descendant-reaper.py
 
 Author:  gh:@yordangit
-Version: 26.09.17
+Version: 26.09.18
 """
 
 import rbd
@@ -50,7 +50,7 @@ class ChainNode:
         self.access_timestamp: Optional[datetime] = None
         self.modify_timestamp: Optional[datetime] = None
         self.snapshot_count: int = 0
-        self.snapshots: List[Dict] = []  # [{'name': str, 'protected': Optional[bool]}]
+        self.snapshots: List[Dict] = []  # [{'name', 'id', 'protected', 'is_trash'}]
         self.error: Optional[str] = None
         self.truncated: bool = False  # hit MAX_CHAIN_DEPTH before fully resolving
         self.phantom_image_id: Optional[str] = None  # set if error is a confirmed phantom entry
@@ -276,7 +276,15 @@ class DescendantReaper:
 
                 try:
                     node.snapshots = [
-                        {'name': s.get('name'), 'protected': self._is_protected_snap(img, s.get('name'))}
+                        {
+                            'name': s.get('name'), 'id': s.get('id'),
+                            'protected': self._is_protected_snap(img, s.get('name')),
+                            # RBD "clone v2" moves a deleted snapshot with live clones into
+                            # a trash namespace instead of blocking the delete - it's then
+                            # only reachable by id, not by name (confirmed against real
+                            # cluster output: even `rbd snap rm --force` can't find it by name).
+                            'is_trash': 'trash' in s,
+                        }
                         for s in img.list_snaps() if s.get('name')
                     ]
                     node.snapshot_count = len(node.snapshots)
@@ -401,6 +409,12 @@ class DescendantReaper:
         for node in order:
             for snap in node.snapshots:
                 snap_ref = f"{self.pool_name}/{node.name}@{snap['name']}"
+                if snap['is_trash']:
+                    # Not reachable by name at all (even --force) - only removable
+                    # by id via the Python binding's remove_snap_by_id().
+                    lines.append(f"# trashed snap (id={snap['id']}) on {snap_ref} - "
+                                 f"remove via: rbd.Image(ioctx, '{node.name}').remove_snap_by_id({snap['id']})")
+                    continue
                 if snap['protected'] is not False:  # True, or unknown - try it
                     lines.append(f"rbd snap unprotect {snap_ref}   # skip if this errors as already unprotected")
                 lines.append(f"rbd snap rm {snap_ref}")
@@ -420,6 +434,11 @@ class DescendantReaper:
             try:
                 with rbd.Image(self.ioctx, node.name) as img:
                     for snap in node.snapshots:
+                        if snap['is_trash']:
+                            # Only reachable by id - name-based lookup always
+                            # resolves to the user namespace, never trash.
+                            img.remove_snap_by_id(snap['id'])
+                            continue
                         if snap['protected'] is not False:  # True, or unknown - try it
                             try:
                                 img.unprotect_snap(snap['name'])
@@ -563,8 +582,12 @@ class DescendantReaper:
                         print(f"  [x] SKIPPED: now has {len(children)} descendant(s) - state changed since analysis")
                         skipped += 1
                         continue
-                    snaps = [{'name': s.get('name'), 'protected': self._is_protected_snap(img, s.get('name'))}
-                             for s in img.list_snaps() if s.get('name')]
+                    snaps = [
+                        {'name': s.get('name'), 'id': s.get('id'),
+                         'protected': self._is_protected_snap(img, s.get('name')),
+                         'is_trash': 'trash' in s}
+                        for s in img.list_snaps() if s.get('name')
+                    ]
             except Exception as e:
                 phantom_id = self._check_phantom_entry(name)
                 if phantom_id:
@@ -584,6 +607,9 @@ class DescendantReaper:
             if not execute:
                 for snap in snaps:
                     snap_ref = f"{self.pool_name}/{name}@{snap['name']}"
+                    if snap['is_trash']:
+                        print(f"    # trashed snap (id={snap['id']}) - remove via remove_snap_by_id(), not rbd CLI")
+                        continue
                     if snap['protected'] is not False:
                         print(f"    rbd snap unprotect {snap_ref}   # skip if this errors as already unprotected")
                     print(f"    rbd snap rm {snap_ref}")
@@ -594,6 +620,9 @@ class DescendantReaper:
             try:
                 with rbd.Image(self.ioctx, name) as img:
                     for snap in snaps:
+                        if snap['is_trash']:
+                            img.remove_snap_by_id(snap['id'])
+                            continue
                         if snap['protected'] is not False:
                             try:
                                 img.unprotect_snap(snap['name'])

@@ -1001,6 +1001,14 @@ class OdfCleaner:
                 print(f"      Removing snapshot: {snap_name}")
                 
                 try:
+                    # RBD "clone v2" moves a deleted snapshot with live clones
+                    # into a trash namespace instead of blocking the delete
+                    if 'trash' in snap:
+                        img.remove_snap_by_id(snap['id'])
+                        print(f"        Successfully removed trashed snapshot: {snap_name}")
+                        time.sleep(2)
+                        continue
+
                     # Unprotect if protected
                     if img.is_protected_snap(snap_name):
                         print(f"        Unprotecting snapshot: {snap_name}")
