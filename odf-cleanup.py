@@ -351,11 +351,18 @@ class OdfCleaner:
         
         return csi_snaps
     
-    def _direct_children_trash_safe(self, img) -> List[Dict]:
+    def _direct_children_trash_safe(self, img) -> Tuple[List[Dict], bool]:
         """One level of children via set_snap()/set_snap_by_id() per snapshot +
-        list_children2(), works when a snapshot is in RBD's trash namespace,
-        which makes list_descendants() fail"""
+        list_children2() - works even when a snapshot is in RBD's trash
+        namespace, which makes list_descendants() fail outright (confirmed
+        against real cluster output: a trashed snap can still have a live
+        child, which is exactly why it's still sitting there). The caller's
+        own BFS loop handles recursion, so this only needs one level.
+        Returns (children, ok) - ok=False means at least one snapshot's
+        children couldn't be listed (confirmed this can happen even via
+        set_snap_by_id) - that's "unknown", never "confirmed no children"."""
         children = []
+        ok = True
         for snap in img.list_snaps():
             try:
                 if 'trash' in snap:
@@ -363,19 +370,23 @@ class OdfCleaner:
                 else:
                     img.set_snap(snap['name'])
             except Exception:
+                ok = False
                 continue
             try:
                 children.extend(img.list_children2())
             except AttributeError:
-                children.extend({'image': c[1], 'trash': False} for c in img.list_children())
+                try:
+                    children.extend({'image': c[1], 'trash': False} for c in img.list_children())
+                except Exception:
+                    ok = False
             except Exception:
-                pass
+                ok = False
             finally:
                 try:
                     img.set_snap(None)
                 except Exception:
                     pass
-        return children
+        return children, ok
 
     def _discover_descendants_and_dependencies(self, discovered_images: List[OdfImage]) -> Tuple[List[OdfImage], Dict[str, List[str]]]:
         """Recursively scan for missing descendants and track trash dependencies"""
@@ -404,7 +415,9 @@ class OdfCleaner:
                         try:
                             descendants = list(img.list_descendants())
                         except Exception:
-                            descendants = self._direct_children_trash_safe(img)
+                            descendants, ok = self._direct_children_trash_safe(img)
+                            if not ok:
+                                raise RuntimeError("could not fully resolve descendants (trash-safe fallback incomplete)")
                         
                         for desc in descendants:
                             if isinstance(desc, dict):

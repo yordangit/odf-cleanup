@@ -93,7 +93,7 @@ graph TD
 
 #### `_direct_children_trash_safe()` / `_walk_descendants_trash_safe()`
 **When:** `list_descendants()` fails outright (trash-namespace snapshot on the image)
-**Does:** `_direct_children_trash_safe()` gets one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (trash-namespace snaps are only reachable by id); `_walk_descendants_trash_safe()` repeats this recursively since `list_children2()` is single-level, unlike `list_descendants()`
+**Does:** `_direct_children_trash_safe()` gets one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (trash-namespace snaps are only reachable by id); `_walk_descendants_trash_safe()` repeats this recursively since `list_children2()` is single-level, unlike `list_descendants()`. Both return `(children, ok)` - `ok=False` means at least one snapshot's children couldn't be listed (confirmed against real cluster output that `list_children2()` can throw the same ENOENT even via `set_snap_by_id()`) - this must surface as an `error`, never as "confirmed no children"
 
 #### `_inspect_node()`
 **Does:**

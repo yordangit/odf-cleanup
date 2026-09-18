@@ -328,13 +328,17 @@ class DescendantReaper:
                 reasons.append(f"{node.name}: chain exceeds MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH}, stopped resolving")
         return "; ".join(reasons) if reasons else "unknown"
 
-    def _direct_children_trash_safe(self, img) -> List[Dict]:
+    def _direct_children_trash_safe(self, img) -> (List[Dict], bool):
         """One level of children via set_snap()/set_snap_by_id() per snapshot +
         list_children2() - works even when a snapshot is in RBD's trash
         namespace, which makes list_descendants() fail outright (confirmed
         against real cluster output: a trashed snap can still have a live
-        child, which is exactly why it's still sitting there)."""
+        child, which is exactly why it's still sitting there). Returns
+        (children, ok) - ok=False means at least one snapshot's children
+        couldn't be listed (confirmed this can happen even via set_snap_by_id)
+        - that's "unknown", never treat it as "confirmed no children"."""
         children = []
+        ok = True
         for snap in img.list_snaps():
             try:
                 if 'trash' in snap:
@@ -342,33 +346,43 @@ class DescendantReaper:
                 else:
                     img.set_snap(snap['name'])
             except Exception:
+                ok = False
                 continue
             try:
                 children.extend(img.list_children2())
             except AttributeError:
-                children.extend({'image': c[1], 'trash': False} for c in img.list_children())
+                try:
+                    children.extend({'image': c[1], 'trash': False} for c in img.list_children())
+                except Exception:
+                    ok = False
             except Exception:
-                pass
+                ok = False
             finally:
                 try:
                     img.set_snap(None)
                 except Exception:
                     pass
-        return children
+        return children, ok
 
-    def _walk_descendants_trash_safe(self, root_name: str) -> List[Dict]:
+    def _walk_descendants_trash_safe(self, root_name: str) -> (List[Dict], bool):
         """Recursive fallback for list_descendants() - only used when it fails
-        outright. list_children2() is single-level, so this does its own BFS."""
+        outright. list_children2() is single-level, so this does its own BFS.
+        Returns (children, ok) - ok=False if any node's children couldn't be
+        fully resolved (must not be reported as a clean/empty result)."""
         all_children = []
         seen = set()
+        all_ok = True
         queue = [root_name]
         while queue:
             name = queue.pop(0)
             try:
                 with rbd.Image(self.ioctx, name) as img:
-                    direct = self._direct_children_trash_safe(img)
+                    direct, ok = self._direct_children_trash_safe(img)
             except Exception:
+                all_ok = False
                 continue
+            if not ok:
+                all_ok = False
             for c in direct:
                 child_name = c.get('image') or c.get('name')
                 if not child_name or child_name in seen:
@@ -377,7 +391,7 @@ class DescendantReaper:
                 if not c.get('trash', False):
                     all_children.append(c)
                     queue.append(child_name)
-        return all_children
+        return all_children, all_ok
 
     def analyze_volume(self, volume_name: str) -> (List[ChainNode], Optional[str], Optional[str]):
         """Returns (roots, error, phantom_image_id). error != None means the
@@ -387,7 +401,9 @@ class DescendantReaper:
                 try:
                     flat = [d for d in img.list_descendants() if not d.get('trash', False)]
                 except Exception:
-                    flat = self._walk_descendants_trash_safe(volume_name)
+                    flat, ok = self._walk_descendants_trash_safe(volume_name)
+                    if not ok:
+                        raise RuntimeError("could not fully resolve descendants (trash-safe walk incomplete)")
         except Exception as e:
             error = f"could not read descendants of {volume_name}: {e}"
             phantom_id = self._check_phantom_entry(volume_name)
