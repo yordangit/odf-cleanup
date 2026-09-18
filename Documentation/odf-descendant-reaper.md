@@ -56,7 +56,7 @@ graph TD
 - `all_nodes()` - flattens this node and every descendant beneath it (used by classify/removal-order/execute)
 
 ### 2. `DescendantReaper`
-**Purpose:** Connects to ODF and walks/classifies descendant chains for a GUID or a specific image.
+**Purpose:** Connects to ODF and walks/classifies descendant chains for a GUID or a specific image, or removes an explicit list of pre-vetted image names.
 
 ---
 
@@ -132,6 +132,17 @@ graph TD
 - Only offers/attempts removal of the volume itself once **all** its descendant chains are safe (matches what would actually let `odf-cleanup.py` succeed)
 - Returns one of: `NO_VOLUMES_FOUND`, `ERROR`, `CLEAN`, `ALL_SAFE`, `NEEDS_REVIEW`, `RESOLVED` (execute-only)
 
+### Direct Removal Mode
+
+#### `cleanup_named_images()`
+**When:** `CL_CLEANUP_LIST` is set (a file of image names, one per line) instead of `CL_LAB`/`CL_VOLUME`
+**Purpose:** Removes an explicit list of images an external caller (`odf-oc-compare.py`) already verified safe - bypasses `classify()`/chain-walking entirely, since that logic has no Kubernetes ownership awareness
+**Does:**
+- Per image: fresh `_get_watchers()` and `list_descendants()` check (cluster state can change between analysis and execution), then removes it (or prints what it would do, in dry-run)
+- An unopenable image is checked via `_check_phantom_entry()` before being skipped
+- Anything with a watcher, children, or an unresolved open error is skipped (not a failure) - only actual removal errors count as `failed`
+- Returns `False` only if a removal genuinely failed
+
 ---
 
 ## Main Entry Point
@@ -139,9 +150,10 @@ graph TD
 ### `main()`
 **Does:**
 - Derives `execute` from `DRY_RUN` (default `"true"` - discovery-only), same convention as `odf-cleanup.py`
-- Validates required env vars (`CL_POOL`, `CL_CONF`, `CL_KEYRING`) and that one of `CL_LAB`/`CL_VOLUME` is set
+- Validates required env vars (`CL_POOL`, `CL_CONF`, `CL_KEYRING`) and that one of `CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST` is set
+- `CL_CLEANUP_LIST` takes precedence and dispatches to `cleanup_named_images()` instead of `analyze_guid()`
 - Prints a live-mode warning banner when `DRY_RUN=false`
-- Exit code: `0` only for `NO_VOLUMES_FOUND` / `CLEAN` / `RESOLVED` - anything else (including `ERROR`/`NEEDS_REVIEW`/`ALL_SAFE` in dry-run) is non-zero, so a calling script knows this GUID still needs attention
+- Exit code: `0` only for `NO_VOLUMES_FOUND` / `CLEAN` / `RESOLVED` (or `cleanup_named_images()` returning `True`) - anything else is non-zero, so a calling script knows this still needs attention
 
 ---
 
@@ -166,8 +178,9 @@ graph TD
 
 **Usage:**
 ```bash
-export CL_LAB="your-guid"      # or CL_VOLUME="specific-image-name"
-export DRY_RUN="true"          # false to actually remove what's classified safe
+export CL_LAB="your-guid"           # or CL_VOLUME="specific-image-name", or
+export CL_CLEANUP_LIST="names.txt"  # file of pre-vetted image names to remove directly
+export DRY_RUN="true"               # false to actually remove what's classified/listed safe
 python3 utils/odf-descendant-reaper.py
 ```
 
@@ -218,3 +231,16 @@ Classification is deliberately conservative - false negatives (flagging somethin
 
 #### **Key Point:**
 Execute mode only ever acts on causes it has fully diagnosed - anything it can't explain is left for manual review rather than guessed at.
+
+### Direct Removal Mode Decision
+
+#### Decision Mechanisms:
+- `odf-oc-compare.py`'s parentless csi-snap/csi-vol analysis already checks RBD children **and** Kubernetes ownership (`VolumeSnapshotContent`/`PersistentVolume`) - `classify()` here only ever checks watchers, so it's not a substitute
+- These images have no lab GUID, so `odf-cleanup.py` (GUID-scoped) can't process them either
+
+#### Strategy:
+- Trust the caller's `SAFE TO DELETE` verdict for *which* images to target, but never trust that the cluster hasn't changed since - re-check watchers and children fresh, per image, right before removing it
+- Keep this fully separate from `classify()`/chain-walking rather than trying to make that logic Kubernetes-aware too
+
+#### **Key Point:**
+This mode is deliberately dumb about *why* something is safe (that's `odf-oc-compare.py`'s job) and only responsible for confirming it's *still* safe right now.

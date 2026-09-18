@@ -762,8 +762,18 @@ class OdfOpenShiftComparator:
     
     def generate_cleanup_script(self, output_file: str = "cleanup_orphaned_guids.sh"):
         """Generate bash script for automated cleanup"""
-        if not self.orphaned_guids:
-            print("No orphaned GUIDs found - no cleanup script needed")
+        # Parentless csi-snap/csi-vol images verified SAFE TO DELETE (zero RBD
+        # children AND no live k8s reference) - these have no lab GUID, so
+        # odf-cleanup.py can't process them. Handled separately via the reaper's
+        # CL_CLEANUP_LIST mode, which re-checks watchers/children fresh before
+        # removing each one (cluster state can change between analysis and now).
+        safe_csi_leftovers = sorted(
+            [n for n, a in self.parentless_csi_snaps.items() if a['recommendation'].startswith('SAFE TO DELETE')] +
+            [n for n, a in self.parentless_csi_vols.items() if a['recommendation'].startswith('SAFE TO DELETE')]
+        )
+
+        if not self.orphaned_guids and not safe_csi_leftovers:
+            print("No orphaned GUIDs or safe CSI leftovers found - no cleanup script needed")
             return
         
         print(f"\nGenerating cleanup script: {output_file}")
@@ -778,6 +788,21 @@ class OdfOpenShiftComparator:
         priority_1_guids = [guid for guid, cat, counts in ordered_guids if 'priority 1' in cat]
         priority_2_guids = [guid for guid, cat, counts in ordered_guids if 'priority 2' in cat]
         priority_3_guids = [guid for guid, cat, counts in ordered_guids if 'priority 3' in cat]
+
+        csi_leftovers_block = ""
+        if safe_csi_leftovers:
+            leftover_lines = "\n".join(safe_csi_leftovers)
+            csi_leftovers_block = f'''
+echo "=== Cleaning up {len(safe_csi_leftovers)} parentless CSI leftover(s) (k8s ownership verified) ==="
+CSI_LEFTOVERS_FILE="csi_leftovers_safe_to_delete.txt"
+cat > "$CSI_LEFTOVERS_FILE" <<'CSILIST'
+{leftover_lines}
+CSILIST
+unset CL_LAB CL_VOLUME
+export CL_CLEANUP_LIST="$CSI_LEFTOVERS_FILE"
+python3 utils/odf-descendant-reaper.py
+echo ""
+'''
         
         script_content = f"""#!/bin/bash
 # Generated orphaned GUID cleanup script
@@ -857,7 +882,7 @@ for guid in $PRIORITY_3_GUIDS; do
     process_guid "$guid" "Priority 3 - volumes + snapshots + trash"
     echo ""
 done
-
+{csi_leftovers_block}
 echo "Cleanup script completed!"
 if [ -f "$NEEDS_REVIEW_FILE" ]; then
     echo ""
@@ -874,6 +899,8 @@ fi
             
             print(f"[v] Cleanup script created: {output_file}")
             print(f"  Contains {len(self.orphaned_guids)} orphaned GUIDs")
+            if safe_csi_leftovers:
+                print(f"  Plus {len(safe_csi_leftovers)} parentless csi-snap/csi-vol leftover(s) (k8s ownership verified)")
             print(f"  Run with: ./{output_file}")
             print("  WARNING: DRY_RUN defaults to false - this will actually delete.")
             print("  It will prompt for confirmation before proceeding; set DRY_RUN=\"true\" in the script to preview first.")

@@ -137,6 +137,8 @@ graph TD
 - Orders GUIDs by cleanup priority (simple → complex)
 - Defaults `DRY_RUN="false"` (live) but prompts for `y/n` confirmation before running anything
 - Per GUID, runs `odf-cleanup.py` (which now self-handles watcher checks and phantom entries); on failure it's logged to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py` instead of being retried automatically
+- Appends a section that writes every parentless csi-snap/csi-vol name marked `SAFE TO DELETE` to a file and runs `odf-descendant-reaper.py` in its `CL_CLEANUP_LIST` mode against it (these have no GUID, so `odf-cleanup.py` can't touch them); omitted entirely if there are none
+- Script is generated even with zero orphaned GUIDs, as long as there's at least one safe CSI leftover to clean up
 
 ---
 
@@ -183,7 +185,7 @@ graph TD
 ### Output Generation
 - **Detailed Reporting:** Comprehensive analysis with actionable recommendations
 - **Automated Scripts:** Generates ready-to-run cleanup scripts, live by default with a confirmation prompt
-- **Safety Features:** `odf-cleanup.py` self-handles watchers/phantoms; manual-review logging for anything it still can't resolve
+- **Safety Features:** `odf-cleanup.py` self-handles watchers/phantoms; manual-review logging for anything it still can't resolve; `odf-descendant-reaper.py`'s `CL_CLEANUP_LIST` mode re-verifies watchers/children fresh before removing any SAFE TO DELETE CSI leftover
 - **Progress Tracking:** Statistics and status reporting throughout process
 
 ---
@@ -251,7 +253,7 @@ Complexity ordering ensures **progressive risk management** by handling simple, 
 - **Progressive Execution:** Process by priority levels with clear separation
 
 #### **Key Point:**
-Script generation defaults to actually completing the cleanup rather than just previewing it, but never proceeds without an explicit `y/n` confirmation, and never silently drops a GUID it couldn't resolve. `odf-descendant-reaper.py` is intentionally kept out of the automated path now - it remains a standalone manual diagnostic tool for the cases `odf-cleanup.py` genuinely can't resolve on its own (e.g. a watched descendant that IS part of the target GUID).
+Script generation defaults to actually completing the cleanup rather than just previewing it, but never proceeds without an explicit `y/n` confirmation, and never silently drops a GUID it couldn't resolve. `odf-descendant-reaper.py`'s GUID-based chain-walking (`analyze_guid()`) is intentionally kept out of the automated path - it remains a standalone manual diagnostic tool for cases `odf-cleanup.py` genuinely can't resolve on its own. Its separate `CL_CLEANUP_LIST` mode *is* wired into the generated script, but only for the parentless CSI leftovers this tool already verified via Kubernetes ownership - `odf-cleanup.py` is GUID-scoped and can't reach GUID-less images anyway.
 
 ### Parentless CSI Snapshot/Volume Analysis Decision
 

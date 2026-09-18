@@ -10,9 +10,11 @@ Requirements:
 - ODF cluster credentials (CL_CONF, CL_KEYRING environment variables)
 
 Usage:
-    export CL_LAB="your-guid"      # bare GUID, or full "{config}-{guid}" prefix, OR
-    export CL_VOLUME="some-image"  # a specific image name to inspect directly
-    export DRY_RUN="false"         # actually delete what's classified safe (default: true)
+    export CL_LAB="your-guid"           # bare GUID, or full "{config}-{guid}" prefix, OR
+    export CL_VOLUME="some-image"       # a specific image name to inspect directly, OR
+    export CL_CLEANUP_LIST="path.txt"   # file of pre-vetted image names (one per line)
+                                         # to remove directly, no chain-walking/classify()
+    export DRY_RUN="false"              # actually delete what's classified/listed safe (default: true)
     python3 utils/odf-descendant-reaper.py
 
 Author:  gh:@yordangit
@@ -538,6 +540,80 @@ class DescendantReaper:
         return 'NEEDS_REVIEW'
 
 
+    def cleanup_named_images(self, names: List[str], execute: bool) -> bool:
+        """Remove specific images already vetted as safe by an external caller
+        (e.g. odf-oc-compare.py's k8s-verified SAFE TO DELETE list for
+        parentless csi-snap/csi-vol images) - not routed through classify()/
+        chain-walking, which has no k8s awareness of its own. Still does one
+        fresh watcher + children check per image here, since cluster state
+        can change between analysis and execution. Returns False if any
+        removal actually failed (skips are not failures)."""
+        removed = skipped = failed = 0
+        for name in names:
+            print(f"\n{name}:")
+            try:
+                with rbd.Image(self.ioctx, name) as img:
+                    watchers = self._get_watchers(img, name)
+                    if watchers:
+                        print(f"  [x] SKIPPED: now has active watcher(s) {watchers} - state changed since analysis")
+                        skipped += 1
+                        continue
+                    children = [d for d in img.list_descendants() if not d.get('trash', False)]
+                    if children:
+                        print(f"  [x] SKIPPED: now has {len(children)} descendant(s) - state changed since analysis")
+                        skipped += 1
+                        continue
+                    snaps = [{'name': s.get('name'), 'protected': self._is_protected_snap(img, s.get('name'))}
+                             for s in img.list_snaps() if s.get('name')]
+            except Exception as e:
+                phantom_id = self._check_phantom_entry(name)
+                if phantom_id:
+                    if execute:
+                        if self._execute_phantom_cleanup(name, phantom_id):
+                            removed += 1
+                        else:
+                            failed += 1
+                    else:
+                        print(f"  {self._format_phantom_message(name, phantom_id)}")
+                        removed += 1
+                    continue
+                print(f"  [x] SKIPPED: could not open image: {e}")
+                skipped += 1
+                continue
+
+            if not execute:
+                for snap in snaps:
+                    snap_ref = f"{self.pool_name}/{name}@{snap['name']}"
+                    if snap['protected'] is not False:
+                        print(f"    rbd snap unprotect {snap_ref}   # skip if this errors as already unprotected")
+                    print(f"    rbd snap rm {snap_ref}")
+                print(f"    rbd rm {self.pool_name}/{name}")
+                removed += 1
+                continue
+
+            try:
+                with rbd.Image(self.ioctx, name) as img:
+                    for snap in snaps:
+                        if snap['protected'] is not False:
+                            try:
+                                img.unprotect_snap(snap['name'])
+                            except Exception:
+                                pass
+                        img.remove_snap(snap['name'])
+                rbd.RBD().remove(self.ioctx, name)
+                print(f"  [v] Removed")
+                removed += 1
+            except Exception as e:
+                print(f"  [x] FAILED to remove: {e}")
+                failed += 1
+
+        print("\n" + "=" * 80)
+        verb = "removed" if execute else "would be removed"
+        print(f"SUMMARY: {removed} {verb}, {skipped} skipped (state changed/unsafe), {failed} failed")
+        print("=" * 80)
+        return failed == 0
+
+
 def main():
     """Main entry point"""
     dry_run = os.environ.get('DRY_RUN', 'true').lower() in ['true', '1', 'yes']
@@ -554,8 +630,9 @@ def main():
         for env in required_envs:
             print(f"  {env}")
         print("\nAlso required, one of:")
-        print("  CL_LAB     - GUID whose volumes should be inspected")
-        print("  CL_VOLUME  - a specific image name to inspect directly")
+        print("  CL_LAB          - GUID whose volumes should be inspected")
+        print("  CL_VOLUME       - a specific image name to inspect directly")
+        print("  CL_CLEANUP_LIST - file of pre-vetted image names (one per line) to remove directly")
         print("\nOptional:")
         print("  MAX_CHAIN_DEPTH=N  - depth cap before forcing NEEDS_REVIEW (default: 10)")
         print("  DRY_RUN=[true/false]  - false actually deletes SAFE_TO_REMOVE chains + phantom entries (default: true)")
@@ -564,16 +641,22 @@ def main():
 
     guid = os.environ.get('CL_LAB')
     volume_name = os.environ.get('CL_VOLUME')
+    cleanup_list_file = os.environ.get('CL_CLEANUP_LIST')
 
-    if not guid and not volume_name:
-        print("[x] Error: Set either CL_LAB (GUID) or CL_VOLUME (specific image name)")
+    if not guid and not volume_name and not cleanup_list_file:
+        print("[x] Error: Set one of CL_LAB (GUID), CL_VOLUME (image name), or CL_CLEANUP_LIST (file of image names)")
         return 1
 
     debug = os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
 
+    if cleanup_list_file:
+        target_desc = f"image list from {cleanup_list_file}"
+    else:
+        target_desc = 'GUID ' + guid if guid else 'Volume ' + volume_name
+
     print("Configuration:")
     print(f"  Pool: {os.environ['CL_POOL']}")
-    print(f"  Target: {'GUID ' + guid if guid else 'Volume ' + volume_name}")
+    print(f"  Target: {target_desc}")
     print(f"  Max chain depth: {MAX_CHAIN_DEPTH}")
     print(f"  Dry Run: {'YES' if dry_run else 'NO'}")
     print(f"  Debug: {'YES' if debug else 'NO'}")
@@ -590,6 +673,18 @@ def main():
         return 1
 
     try:
+        if cleanup_list_file:
+            try:
+                with open(cleanup_list_file) as f:
+                    names = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+            except Exception as e:
+                print(f"[x] Error reading {cleanup_list_file}: {e}")
+                return 1
+            if not names:
+                print("[v] Cleanup list is empty - nothing to do")
+                return 0
+            return 0 if reaper.cleanup_named_images(names, execute=execute) else 1
+
         status = reaper.analyze_guid(guid, volume_name, execute=execute)
         # Exit 0 only when there's nothing left blocking normal cleanup;
         # non-zero tells a caller (e.g. a wrapper script) this GUID still
