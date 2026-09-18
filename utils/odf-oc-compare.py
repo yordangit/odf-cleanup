@@ -9,8 +9,9 @@ This script discovers:
 Requirements:
 - Python packages: pip install kubernetes rados rbd
 - Valid kubeconfig with access to Kubernetes/OpenShift cluster
-  (needs cluster-scoped read access to VolumeSnapshotContents, used to verify
-  parentless CSI snapshot ownership before recommending deletion)
+  (needs cluster-scoped read access to VolumeSnapshotContents and
+  PersistentVolumes, used to verify parentless csi-snap/csi-vol ownership
+  before recommending deletion)
 - ODF cluster credentials (CL_CONF, CL_KEYRING environment variables)
 
 Author:  gh:@yordangit
@@ -54,12 +55,18 @@ class OdfOpenShiftComparator:
         # still be actively backing a live VolumeSnapshot). None means "couldn't
         # load them" (fail safe into REVIEW), [] means "loaded, there are none".
         self.volume_snapshot_contents: Optional[List[Dict]] = None
+
+        # Same idea as volume_snapshot_contents, but for parentless csi-vol
+        # ownership via PersistentVolume.spec.csi.volumeHandle.
+        self.persistent_volumes: Optional[List[Dict]] = None
         
         # Cache for CSI snapshot parent lookups to avoid re-evaluation
         self.csi_snap_guid_cache: Dict[str, Optional[str]] = {}
+        self.csi_vol_guid_cache: Dict[str, Optional[str]] = {}
         
-        # Track parentless CSI snapshots and their children analysis
+        # Track parentless CSI snapshots/volumes and their children analysis
         self.parentless_csi_snaps: Dict[str, Dict] = {}  # {snap_name: {children: [...], child_guids: [...], analysis: ...}}
+        self.parentless_csi_vols: Dict[str, Dict] = {}
         
         # Cache expensive operations to avoid repeated RBD calls
         self._cached_ordered_guids: Optional[List[tuple]] = None
@@ -173,6 +180,22 @@ class OdfOpenShiftComparator:
             self.volume_snapshot_contents = None  # distinguish "couldn't check" from "checked, found none"
             return False
 
+    def discover_persistent_volumes(self) -> bool:
+        """Load all PersistentVolumes so we can verify csi-vol ownership.
+        Non-fatal on failure - callers fall back to REVIEW."""
+        print("Discovering PersistentVolume objects from OpenShift...")
+        try:
+            core_api = client.CoreV1Api()
+            result = core_api.list_persistent_volume()
+            self.persistent_volumes = [pv.to_dict() for pv in result.items]
+            print(f"  Found {len(self.persistent_volumes)} PersistentVolume objects")
+            return True
+        except Exception as e:
+            print(f"[x] Error discovering PersistentVolumes: {e}")
+            print("  Parentless csi-vol images with no RBD children will be marked REVIEW instead of SAFE TO DELETE")
+            self.persistent_volumes = None
+            return False
+
     def discover_odf_guids(self) -> bool:
         """Discover all lab GUIDs from ODF RBD images"""
         print("Discovering lab GUIDs from ODF RBD images...")
@@ -249,8 +272,18 @@ class OdfOpenShiftComparator:
                     if self.debug:
                         print(f"    Found GUID: {guid} (from CSI snap parent: {img_name})")
                     return guid
+
+            # Pattern 3: csi-vol-{UUID} - check parent for GUID
+            if 'csi-vol' in img_name and source == "active":
+                guid = self._get_guid_from_csi_vol_parent(img_name)
+                if guid:
+                    self.odf_guids.add(guid)
+                    self.stats['odf_volumes_found'] += 1
+                    if self.debug:
+                        print(f"    Found GUID: {guid} (from CSI vol parent: {img_name})")
+                    return guid
             
-            if self.debug and (any(p in img_name for p in CLUSTER_NAME_PREFIXES) or 'csi-snap' in img_name):
+            if self.debug and (any(p in img_name for p in CLUSTER_NAME_PREFIXES) or 'csi-snap' in img_name or 'csi-vol' in img_name):
                 print(f"    Could not extract GUID from: {img_name}")
                 
         except Exception as e:
@@ -287,6 +320,32 @@ class OdfOpenShiftComparator:
         if guid is None and 'csi-snap' in csi_snap_name:
             self._analyze_parentless_csi_snap(csi_snap_name)
         
+        return guid
+
+    def _get_guid_from_csi_vol_parent(self, csi_vol_name: str) -> Optional[str]:
+        """Get GUID from csi-vol's parent image (with caching)"""
+        if csi_vol_name in self.csi_vol_guid_cache:
+            return self.csi_vol_guid_cache[csi_vol_name]
+
+        guid = None
+        try:
+            with rbd.Image(self.ioctx, csi_vol_name) as img:
+                parent_info = img.parent_info()
+                if parent_info and len(parent_info) >= 2:
+                    parent_pool, parent_image = parent_info[0], parent_info[1]
+                    match = VOLUME_GUID_PATTERN.search(parent_image)
+                    if match:
+                        guid = match.group(1)
+        except Exception as e:
+            if self.debug:
+                print(f"      Warning: Could not check parent for {csi_vol_name}: {e}")
+
+        self.csi_vol_guid_cache[csi_vol_name] = guid
+
+        # If no GUID found (no parent), this might be a parentless csi-vol
+        if guid is None:
+            self._analyze_parentless_csi_vol(csi_vol_name)
+
         return guid
     
     def _check_csi_snap_k8s_ownership(self, csi_snap_name: str) -> Dict:
@@ -402,6 +461,113 @@ class OdfOpenShiftComparator:
             analysis['recommendation'] = 'ERROR - could not analyze'
         
         self.parentless_csi_snaps[csi_snap_name] = analysis
+
+    def _check_csi_vol_k8s_ownership(self, csi_vol_name: str) -> Dict:
+        """Match csi-vol's UUID against PV volumeHandles to check real ownership.
+        Returns {'checked', 'found', 'namespace', 'namespace_active', 'pv_name'}."""
+        result = {'checked': False, 'found': False, 'namespace': None,
+                  'namespace_active': None, 'pv_name': None}
+
+        if self.persistent_volumes is None:
+            return result  # couldn't load PVs at all - stays unchecked, caller should fail safe
+
+        result['checked'] = True
+
+        match = re.search(r'csi-vol-([a-f0-9-]+)', csi_vol_name)
+        if not match:
+            return result
+        vol_uuid = match.group(1)
+
+        for pv in self.persistent_volumes:
+            spec = pv.get('spec') or {}
+            csi = spec.get('csi') or {}
+            handle = csi.get('volume_handle') or ''
+            if vol_uuid in handle:
+                result['found'] = True
+                result['pv_name'] = (pv.get('metadata') or {}).get('name')
+                claim_ref = spec.get('claim_ref') or {}
+                namespace = claim_ref.get('namespace')
+                result['namespace'] = namespace
+                if namespace:
+                    result['namespace_active'] = namespace in self.all_namespace_names
+                break
+
+        return result
+
+    def _analyze_parentless_csi_vol(self, csi_vol_name: str):
+        """Analyze a parentless csi-vol volume to find children and their GUIDs"""
+        if csi_vol_name in self.parentless_csi_vols:
+            return  # Already analyzed
+
+        analysis = {
+            'children': [],
+            'child_guids': [],
+            'active_child_guids': [],
+            'orphaned_child_guids': [],
+            'total_children': 0,
+            'has_active_children': False,
+            'recommendation': 'unknown',
+            'k8s_check': None
+        }
+
+        try:
+            with rbd.Image(self.ioctx, csi_vol_name) as img:
+                descendants = list(img.list_descendants())
+                analysis['total_children'] = len(descendants)
+
+                for desc in descendants:
+                    child_name = desc.get('name', '')
+                    if child_name:
+                        analysis['children'].append(child_name)
+                        child_guid = self._extract_guid_from_name(child_name)
+                        if child_guid:
+                            analysis['child_guids'].append(child_guid)
+                            if child_guid in self.active_namespace_guids:
+                                analysis['active_child_guids'].append(child_guid)
+                                analysis['has_active_children'] = True
+                            elif child_guid in self.odf_guids:
+                                analysis['orphaned_child_guids'].append(child_guid)
+
+                if analysis['has_active_children']:
+                    analysis['recommendation'] = 'KEEP - has active children'
+                elif analysis['orphaned_child_guids']:
+                    analysis['recommendation'] = 'REVIEW - has orphaned children only'
+                elif analysis['total_children'] == 0:
+                    # Zero RBD children doesn't mean zero owners - a PV can
+                    # still point at this csi-vol. Verify against real k8s objects.
+                    k8s_check = self._check_csi_vol_k8s_ownership(csi_vol_name)
+                    analysis['k8s_check'] = k8s_check
+                    if not k8s_check['checked']:
+                        analysis['recommendation'] = (
+                            'REVIEW - no RBD children, but could not verify '
+                            'PersistentVolume ownership (see errors above)'
+                        )
+                    elif k8s_check['found'] and k8s_check['namespace_active']:
+                        analysis['recommendation'] = (
+                            f"KEEP - no RBD children, but still referenced by "
+                            f"PersistentVolume {k8s_check['pv_name']} "
+                            f"in active namespace {k8s_check['namespace']}"
+                        )
+                    elif k8s_check['found']:
+                        ns_desc = k8s_check['namespace'] or 'unknown namespace'
+                        analysis['recommendation'] = (
+                            f"REVIEW - no RBD children, referenced by PersistentVolume "
+                            f"{k8s_check['pv_name']} in orphaned namespace {ns_desc} "
+                            f"(delete the PersistentVolume too)"
+                        )
+                    else:
+                        analysis['recommendation'] = (
+                            'SAFE TO DELETE - no RBD children, no PersistentVolume reference found'
+                        )
+                else:
+                    analysis['recommendation'] = 'REVIEW - children have no GUID pattern'
+
+        except Exception as e:
+            if self.debug:
+                print(f"      Warning: Could not analyze children for {csi_vol_name}: {e}")
+            analysis['recommendation'] = 'ERROR - could not analyze'
+
+        self.parentless_csi_vols[csi_vol_name] = analysis
     
     def _extract_guid_from_name(self, name: str) -> Optional[str]:
         """Extract GUID from any image name using the standard pattern"""
@@ -476,6 +642,25 @@ class OdfOpenShiftComparator:
             print("[v] No parentless CSI snapshots found")
         
         print()
+
+        # Parentless csi-vol analysis
+        if self.parentless_csi_vols:
+            print("PARENTLESS CSI VOLUMES (require manual review):")
+            for vol_name, analysis in sorted(self.parentless_csi_vols.items()):
+                print(f"  {vol_name}:")
+                print(f"    Children: {analysis['total_children']}")
+                if analysis['child_guids']:
+                    print(f"    Child GUIDs: {', '.join(analysis['child_guids'])}")
+                if analysis['active_child_guids']:
+                    print(f"    Active child GUIDs: {', '.join(analysis['active_child_guids'])}")
+                if analysis['orphaned_child_guids']:
+                    print(f"    Orphaned child GUIDs: {', '.join(analysis['orphaned_child_guids'])}")
+                print(f"    Recommendation: {analysis['recommendation']}")
+                print()
+        else:
+            print("[v] No parentless csi-vol volumes found")
+
+        print()
         
         # Summary at the bottom
         print("SUMMARY:")
@@ -487,6 +672,7 @@ class OdfOpenShiftComparator:
         print(f"  Unique ODF GUIDs: {self.stats['unique_odf_guids']}")
         print(f"  Orphaned GUIDs: {self.stats['orphaned_guids']}")
         print(f"  Parentless CSI Snapshots: {len(self.parentless_csi_snaps)}")
+        print(f"  Parentless CSI Volumes: {len(self.parentless_csi_vols)}")
         
         print("="*80)
     
@@ -512,6 +698,10 @@ class OdfOpenShiftComparator:
                     cached_guid = self.csi_snap_guid_cache.get(img_name)
                     if cached_guid == guid:
                         counts['snaps'] += 1
+                elif 'csi-vol' in img_name:
+                    cached_guid = self.csi_vol_guid_cache.get(img_name)
+                    if cached_guid == guid:
+                        counts['volumes'] += 1
             
             # Use cached trash items if available, otherwise fetch (shouldn't happen in normal flow)
             if self._cached_trash_items is not None:
@@ -707,9 +897,10 @@ fi
             if not self.discover_namespace_guids():
                 return False
 
-            # Non-fatal if this fails - parentless csi-snap checks just fall
-            # back to REVIEW instead of trusting the RBD-only "no children" signal.
+            # Non-fatal if this fails - parentless csi-snap/csi-vol checks just
+            # fall back to REVIEW instead of trusting the RBD-only "no children" signal.
             self.discover_volume_snapshot_contents()
+            self.discover_persistent_volumes()
 
             if not self.discover_odf_guids():
                 return False
