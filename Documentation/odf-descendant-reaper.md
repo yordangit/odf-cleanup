@@ -93,10 +93,10 @@ graph TD
 
 #### `_direct_children_trash_safe()` / `_walk_descendants_trash_safe()`
 **When:** `list_descendants()` fails outright (trash-namespace snapshot on the image)
-**Does:** `_direct_children_trash_safe()` gets one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (trash-namespace snaps are only reachable by id); `_walk_descendants_trash_safe()` repeats this recursively since `list_children2()` is single-level, unlike `list_descendants()`. Both return `(children, ok)` - `ok=False` means at least one snapshot's children couldn't be listed (confirmed against real cluster output that `list_children2()` can throw the same ENOENT even via `set_snap_by_id()`) - this must surface as an `error`, never as "confirmed no children". When `list_children2()` throws on a trash-namespace snapshot and `CL_ORPHAN_REPAIR=true`, tries `_diagnose_and_repair_orphan()` before giving up - see "Orphaned Clone Repair" below.
+**Does:** `_direct_children_trash_safe()` gets one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (trash-namespace snaps are only reachable by id); `_walk_descendants_trash_safe()` repeats this recursively since `list_children2()` is single-level, unlike `list_descendants()`. Both return `(children, ok)` - `ok=False` means at least one snapshot's children couldn't be listed (confirmed against real cluster output that `list_children2()` can throw the same ENOENT even via `set_snap_by_id()`) - this must surface as an `error`, never as "confirmed no children". When `list_children2()` throws on a trash-namespace snapshot, tries `_diagnose_and_repair_orphan()` before giving up - see "Orphaned Clone Repair" below.
 
 #### `_diagnose_and_repair_orphan()` / `_repair_orphaned_clone()` / `_rollback_orphan_relink()`
-**When:** `CL_ORPHAN_REPAIR=true` and `list_children2()` failed on a trash-namespace snapshot
+**When:** `list_children2()` failed on a trash-namespace snapshot
 **Purpose:** Handles a real, live corruption class - see "Orphaned Clone Repair" under Workflow Decisions for the full story and the manual procedure this automates
 **Does:**
 - `_diagnose_and_repair_orphan()`: reads the parent's `rbd_header`'s `snap_children_<hex snapid>` omap value directly (`_get_omap_value()`, bypassing `list_children2()`/`list_descendants()` entirely) and decodes it (`_decode_child_image_specs()`) to find the real child image id(s) RBD's clone-v2 tracking still references
@@ -109,12 +109,15 @@ graph TD
 - Opens one image, collects watchers (`_get_watchers`), timestamps (`_get_timestamp`), snapshot protection state (`_is_protected_snap`), and its parent name (`_get_parent_name`)
 - Handles two different Ceph client binding surfaces: `list_watchers()`/`watchers_list()`, `parent_info()`/`parent()`
 
-#### `_check_phantom_entry()`
+#### `_check_phantom_entry()` / `_check_missing_rbdid()`
 **When:** A volume/image can't be opened at all
-**Purpose:** Detects a specific known corruption pattern - `rbd_id.<name>` exists and resolves to an internal id, but that id's `rbd_header` object is missing (the name→id pointer survived, the metadata never landed)
+**Purpose:** Detects two known corruption patterns and sets `self._phantom_pattern` so `_format_phantom_message()`/`_execute_phantom_cleanup()` know which fix applies:
+- `'phantom'`: `rbd_id.<name>` exists and resolves to an internal id, but that id's `rbd_header` object is missing (the name→id pointer survived, the metadata never landed) - unrepairable, only the dangling pointer can be cleaned up
+- `'missing_rbdid'`: the inverse - `rbd_id.<name>` itself is gone, but `rbd_directory`'s `name_<name>` omap key still resolves to an id whose `rbd_header` genuinely exists. A real, valid image, just missing the convenience pointer `rbd.Image()` needs to open by name - safer/simpler to repair than an orphaned clone since two independent sources (`rbd_directory` and `rbd_header`) already agree on the id
 **Does:**
-- `rados stat`s the id object, decodes the packed id value, then checks whether the header object exists
-- Returns the resolved `image_id` only when the header is confirmed missing
+- `_check_phantom_entry()`: `rados stat`s the id object, decodes the packed id value, checks whether the header exists; falls through to `_check_missing_rbdid()` if the id object doesn't exist at all
+- `_check_missing_rbdid()`: reads `rbd_directory`'s `name_<name>` omap value directly (`_get_omap_value()`), decodes it, and confirms the resulting id's header exists
+- Returns the resolved `image_id` for either confirmed pattern, `None` otherwise (never guesses on a third/unknown state)
 
 ### Phase 4: Classification
 
@@ -134,8 +137,8 @@ graph TD
 **Does:** Leaf-first: unprotects + removes every snapshot (trashed ones via `remove_snap_by_id()`, others via `remove_snap()`), then removes each image, directly via the RBD Python bindings - stops at the first failure rather than partially completing and reporting success
 
 #### `_execute_phantom_cleanup()`
-**When:** `execute=True` and `_check_phantom_entry()` confirmed a phantom
-**Does:** Removes the dangling `rbd_id` object and its two `rbd_directory` omap keys via `rados` - never touches `rbd_header` (already gone) or any data object
+**When:** `execute=True` and `_check_phantom_entry()` confirmed a pattern
+**Does:** Applies whichever pattern was detected - for `'phantom'`, removes the dangling `rbd_id` object and its two `rbd_directory` omap keys; for `'missing_rbdid'`, recreates the single missing `rbd_id.<name>` object. Never touches `rbd_header` or any data object either way
 
 ### Main Orchestrator
 
@@ -200,8 +203,9 @@ python3 utils/odf-descendant-reaper.py
 
 **Optional:**
 - `MAX_CHAIN_DEPTH` - depth cap before forcing `NEEDS_REVIEW` (default: 10)
-- `CL_ORPHAN_REPAIR` - also auto-repair orphaned clones invisible to `rbd ls`/`rbd trash ls` (default: false); requires `DRY_RUN=false` to actually act - see "Orphaned Clone Repair" below
 - `DEBUG` - verbose diagnostics, e.g. filtered-watcher details
+
+Orphaned clone repair (see "Orphaned Clone Repair" below) has no separate toggle - diagnosis always runs when the trash-safe fallback hits an unresolvable snapshot, and the actual repair follows the same `DRY_RUN` convention as everything else in execute mode.
 
 ---
 
@@ -283,9 +287,8 @@ A third corruption class, distinct from phantom entries. `rbd_header.<id>` genui
 - **Any check fails → roll back** the temporary relink immediately (`_rollback_orphan_relink()`) and fall through to `NEEDS_REVIEW`, same as any other unresolvable case
 
 #### Strategy:
-- **Opt-in only** (`CL_ORPHAN_REPAIR=true`, separate from `DRY_RUN=false`) - this writes to `rbd_directory`, even temporarily, which is a materially different risk than anything else the reaper does; it should never fire as a side effect of a routine run someone kicks off without knowing this exists
+- **No separate toggle** - diagnosis (reading the omap value, decoding it, printing what was found) always runs when the trash-safe fallback hits an unresolvable snapshot; only the actual relink/remove is gated on `execute=True` (`DRY_RUN=false`), same convention as every other execute-mode action in this tool. Was gated behind a dedicated `CL_ORPHAN_REPAIR` flag initially out of caution, given this writes to `rbd_directory` (even temporarily) - a materially different risk than anything else the reaper does - but removed once confirmed working live on 2 independent GUIDs with zero false positives
 - **Reaper-only, not ported to `odf-cleanup.py`/`_odf-cleanup.sh`** - too invasive for an unattended, auto-triggered job; this is exactly the "extreme case" tier the reaper exists for, while `odf-cleanup.py` handles normal operation
-- Diagnosis (reading the omap value, decoding it, printing what was found) always runs when `CL_ORPHAN_REPAIR=true`, regardless of `DRY_RUN` - only the actual relink/remove is gated on `execute=True`
 
 #### **Key Point:**
 Confirmed and fixed live against a real cluster (see git history / session notes for the full trace): the orphan was found, the byte format was validated against two known-good relationships before trusting the decode of the mystery one, and the repair correctly cleared an `EBUSY` that had been blocking a GUID's entire cleanup chain.

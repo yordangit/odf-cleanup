@@ -903,6 +903,7 @@ echo "Cleanup script completed!"
 if [ -f "$NEEDS_REVIEW_FILE" ]; then
     echo ""
     echo "$(wc -l < "$NEEDS_REVIEW_FILE") GUID(s) still need manual review - see $NEEDS_REVIEW_FILE"
+    echo "Investigate each with: CL_LAB=<guid> python3 $ODF_REAPER"
 fi
 """
         
@@ -920,8 +921,6 @@ fi
             print(f"  Run with: ./{output_file}")
             print("  WARNING: DRY_RUN defaults to false - this will actually delete.")
             print("  It will prompt for confirmation before proceeding; set DRY_RUN=\"true\" in the script to preview first.")
-            print("  Any GUID odf-cleanup.py can't finish is logged to needs_descendant_review.txt -")
-            print("  investigate those manually with: CL_LAB=<guid> python3 odf-descendant-reaper.py")
             
         except Exception as e:
             print(f"[x] Error creating cleanup script: {e}")
