@@ -15,6 +15,9 @@ Usage:
     export CL_CLEANUP_LIST="path.txt"   # file of pre-vetted image names (one per line)
                                          # to remove directly, no chain-walking/classify()
     export DRY_RUN="false"              # actually delete what's classified/listed safe (default: true)
+    export CL_ORPHAN_REPAIR="true"      # also auto-repair orphaned clones invisible to rbd
+                                         # ls/trash ls (see Documentation/odf-descendant-reaper.md);
+                                         # requires DRY_RUN=false to actually act (default: false)
     python3 utils/odf-descendant-reaper.py
 
 Author:  gh:@yordangit
@@ -26,6 +29,7 @@ import rados
 import os
 import re
 import struct
+import subprocess
 from datetime import datetime
 from typing import List, Dict, Optional, Iterator
 
@@ -69,8 +73,9 @@ class ChainNode:
 class DescendantReaper:
     """Connects to ODF and walks/classifies descendant chains for a GUID or image."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, orphan_repair: bool = False):
         self.debug = debug
+        self.orphan_repair = orphan_repair
         self.ioctx = None
         self.pool_name = None
         self.cluster = None
@@ -182,6 +187,195 @@ class DescendantReaper:
         except Exception as e:
             print(f"    [x] Failed to clean up phantom entry {image_name}: {e}")
             return False
+
+    def _get_omap_value(self, obj: str, key: str) -> Optional[bytes]:
+        """Read one raw omap value. Tries the read_op binding first, falls
+        back to the rados CLI (the only path actually validated live against
+        this cluster - see Documentation/odf-descendant-reaper.md)."""
+        try:
+            read_op = self.ioctx.create_read_op()
+            it, _ = self.ioctx.get_omap_vals_by_keys(read_op, (key,))
+            self.ioctx.operate_read_op(read_op, obj)
+            value = dict(it).get(key)
+            read_op.release()
+            if value is not None:
+                return value
+        except Exception as e:
+            if self.debug:
+                print(f"    DEBUG: native omap read failed for {obj}/{key}: {e}")
+        try:
+            result = subprocess.run(['rados', '-p', self.pool_name, 'getomapval', obj, key, '-'],
+                                     capture_output=True, timeout=30)
+            return result.stdout if result.returncode == 0 and result.stdout else None
+        except Exception as e:
+            if self.debug:
+                print(f"    DEBUG: rados CLI omap read failed for {obj}/{key}: {e}")
+            return None
+
+    def _decode_child_image_specs(self, raw: bytes) -> List[Dict]:
+        """Decode a snap_children_<snapid> omap value: a set of
+        {pool_id, image_id, pool_namespace} entries RBD's clone-v2 tracking
+        keeps on the PARENT's own header, independent of list_children2().
+        Byte layout reverse-engineered from real cluster output (not from
+        Ceph source) - see Documentation/odf-descendant-reaper.md. Re-verify
+        if this ever stops matching."""
+        specs = []
+        try:
+            count = struct.unpack_from('<I', raw, 0)[0]
+            offset = 4
+            for _ in range(count):
+                offset += 2  # struct version header, unused
+                body_len = struct.unpack_from('<I', raw, offset)[0]
+                body_start = offset + 4
+                pool_id = struct.unpack_from('<q', raw, body_start)[0]
+                o = body_start + 8
+                id_len = struct.unpack_from('<I', raw, o)[0]
+                o += 4
+                image_id = raw[o:o + id_len].decode('utf-8')
+                o += id_len
+                ns_len = struct.unpack_from('<I', raw, o)[0]
+                o += 4
+                namespace = raw[o:o + ns_len].decode('utf-8', errors='replace')
+                specs.append({'pool_id': pool_id, 'image_id': image_id, 'namespace': namespace})
+                offset = body_start + body_len
+        except Exception as e:
+            if self.debug:
+                print(f"    DEBUG: could not decode ChildImageSpec set: {e}")
+            return []
+        return specs
+
+    def _diagnose_and_repair_orphan(self, image_name: str, snap_id: int, execute: bool) -> bool:
+        """When list_children2() fails on a trashed snapshot, this reads the
+        clone-v2 child pointer straight off the parent's header omap -
+        bypassing list_children2()/list_descendants() entirely - to find a
+        real child image that exists (valid header/data) but is invisible to
+        every listing API and to `rbd ls`/`rbd trash ls`. Only actually
+        removes anything if execute=True. Full manual procedure this
+        automates: Documentation/odf-descendant-reaper.md. Returns True if a
+        repair was made (worth retrying the caller's list_children2())."""
+        try:
+            with rbd.Image(self.ioctx, image_name) as img:
+                parent_id = img.id()
+        except Exception as e:
+            print(f"    [x] Orphan diagnosis: could not reopen {image_name}: {e}")
+            return False
+
+        key = f"snap_children_{snap_id:016x}"
+        raw = self._get_omap_value(f"rbd_header.{parent_id}", key)
+        if raw is None:
+            print(f"    [x] Orphan diagnosis: no {key} on {image_name} (id={parent_id}) - not this pattern")
+            return False
+
+        specs = self._decode_child_image_specs(raw)
+        if not specs:
+            print(f"    [x] Orphan diagnosis: found {key} on {image_name} but could not decode it")
+            return False
+
+        repaired_any = False
+        for spec in specs:
+            child_id = spec['image_id']
+            print(f"    Orphan diagnosis: {image_name}'s snap {snap_id} still internally references "
+                  f"child id={child_id} (pool_id={spec['pool_id']}) - invisible to list_children2()/rbd ls")
+            if execute:
+                if self._repair_orphaned_clone(child_id):
+                    repaired_any = True
+            else:
+                print("    (set DRY_RUN=false with CL_ORPHAN_REPAIR=true to attempt removal)")
+        return repaired_any
+
+    def _repair_orphaned_clone(self, orphan_id: str) -> bool:
+        """Confirm orphan_id matches the known pattern (header exists, no
+        rbd_directory entry, not sitting in rbd trash, itself childless and
+        snapshot-free) and, if so, temporarily relink it into rbd_directory,
+        remove it via the normal API (which correctly detaches it from its
+        parent), then drop the temporary link. Rolls back on any unexpected
+        state rather than guessing. See Documentation/odf-descendant-
+        reaper.md for the full manual procedure this automates."""
+        name = f"orphan-recovery-{orphan_id}"
+
+        if self._get_omap_value("rbd_directory", f"id_{orphan_id}") is not None:
+            print(f"    [x] {orphan_id} already has a rbd_directory entry - not an orphan, skipping")
+            return False
+        try:
+            self.ioctx.stat(f"rbd_header.{orphan_id}")
+        except Exception:
+            print(f"    [x] {orphan_id} has no rbd_header - different corruption pattern "
+                  f"(phantom entry, not orphaned clone), skipping")
+            return False
+        try:
+            if any(t.get('id') == orphan_id for t in rbd.RBD().trash_list(self.ioctx)):
+                print(f"    [x] {orphan_id} is sitting in rbd trash - that's normal, not our "
+                      f"corruption pattern, skipping")
+                return False
+        except Exception:
+            pass  # can't check trash - proceed, the leaf checks below still protect us
+
+        def length_prefixed(s: str) -> bytes:
+            b = s.encode()
+            return struct.pack('<I', len(b)) + b
+
+        try:
+            write_op = self.ioctx.create_write_op()
+            self.ioctx.set_omap(write_op, (f"name_{name}",), (length_prefixed(orphan_id),))
+            self.ioctx.operate_write_op(write_op, "rbd_directory")
+            write_op.release()
+            write_op = self.ioctx.create_write_op()
+            self.ioctx.set_omap(write_op, (f"id_{orphan_id}",), (length_prefixed(name),))
+            self.ioctx.operate_write_op(write_op, "rbd_directory")
+            write_op.release()
+            self.ioctx.write_full(f"rbd_id.{name}", length_prefixed(orphan_id))
+        except Exception as e:
+            print(f"    [x] Could not relink orphan {orphan_id}: {e}")
+            self._rollback_orphan_relink(orphan_id, name)
+            return False
+
+        # Re-verify through the NORMAL API now that it's nameable - never
+        # trust the raw omap read alone for the final safety check.
+        try:
+            with rbd.Image(self.ioctx, name) as img:
+                if list(img.list_snaps()):
+                    print(f"    [x] Orphan {orphan_id} has its own snapshot(s) - too deep to "
+                          f"auto-repair, needs manual review")
+                    self._rollback_orphan_relink(orphan_id, name)
+                    return False
+                try:
+                    if list(img.list_descendants()):
+                        print(f"    [x] Orphan {orphan_id} has its own children - too deep to auto-repair")
+                        self._rollback_orphan_relink(orphan_id, name)
+                        return False
+                except Exception:
+                    print(f"    [x] Orphan {orphan_id}: could not verify it's childless - not auto-repairing")
+                    self._rollback_orphan_relink(orphan_id, name)
+                    return False
+                if self._get_watchers(img, name):
+                    print(f"    [x] Orphan {orphan_id} has active watcher(s) - not auto-repairing")
+                    self._rollback_orphan_relink(orphan_id, name)
+                    return False
+        except Exception as e:
+            print(f"    [x] Could not re-verify relinked orphan {orphan_id}: {e}")
+            self._rollback_orphan_relink(orphan_id, name)
+            return False
+
+        try:
+            rbd.RBD().remove(self.ioctx, name)
+            print(f"    [v] Removed orphaned clone {orphan_id} (was invisible to rbd ls/trash ls)")
+            return True
+        except Exception as e:
+            print(f"    [x] Failed to remove relinked orphan {orphan_id}: {e}")
+            self._rollback_orphan_relink(orphan_id, name)
+            return False
+
+    def _rollback_orphan_relink(self, orphan_id: str, name: str):
+        """Undo the temporary rbd_directory relink without touching the real
+        header/data object - used whenever auto-repair aborts partway through."""
+        try:
+            write_op = self.ioctx.create_write_op()
+            self.ioctx.remove_omap_keys(write_op, (f"name_{name}", f"id_{orphan_id}"))
+            self.ioctx.operate_write_op(write_op, "rbd_directory")
+            write_op.release()
+            self.ioctx.remove_object(f"rbd_id.{name}")
+        except Exception:
+            pass
 
     # Name varies by packaging: docs say list_watchers(), RHEL9's
     # python3-rbd 18.2.8 exposes watchers_list() instead. Try both.
@@ -328,7 +522,7 @@ class DescendantReaper:
                 reasons.append(f"{node.name}: chain exceeds MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH}, stopped resolving")
         return "; ".join(reasons) if reasons else "unknown"
 
-    def _direct_children_trash_safe(self, img) -> (List[Dict], bool):
+    def _direct_children_trash_safe(self, img, image_name: str, execute: bool = False) -> (List[Dict], bool):
         """One level of children via set_snap()/set_snap_by_id() per snapshot +
         list_children2() - works even when a snapshot is in RBD's trash
         namespace, which makes list_descendants() fail outright (confirmed
@@ -356,7 +550,19 @@ class DescendantReaper:
                 except Exception:
                     ok = False
             except Exception:
-                ok = False
+                # Can be a genuinely unresolvable case, or the "orphaned
+                # clone" corruption pattern documented in
+                # Documentation/odf-descendant-reaper.md - only try to
+                # auto-repair when CL_ORPHAN_REPAIR opted in.
+                repaired = (self.orphan_repair and 'trash' in snap
+                            and self._diagnose_and_repair_orphan(image_name, snap['id'], execute))
+                if repaired:
+                    try:
+                        children.extend(img.list_children2())
+                    except Exception:
+                        ok = False
+                else:
+                    ok = False
             finally:
                 try:
                     img.set_snap(None)
@@ -364,7 +570,7 @@ class DescendantReaper:
                     pass
         return children, ok
 
-    def _walk_descendants_trash_safe(self, root_name: str) -> (List[Dict], bool):
+    def _walk_descendants_trash_safe(self, root_name: str, execute: bool = False) -> (List[Dict], bool):
         """Recursive fallback for list_descendants() - only used when it fails
         outright. list_children2() is single-level, so this does its own BFS.
         Returns (children, ok) - ok=False if any node's children couldn't be
@@ -377,7 +583,7 @@ class DescendantReaper:
             name = queue.pop(0)
             try:
                 with rbd.Image(self.ioctx, name) as img:
-                    direct, ok = self._direct_children_trash_safe(img)
+                    direct, ok = self._direct_children_trash_safe(img, name, execute)
             except Exception:
                 all_ok = False
                 continue
@@ -393,7 +599,7 @@ class DescendantReaper:
                     queue.append(child_name)
         return all_children, all_ok
 
-    def analyze_volume(self, volume_name: str) -> (List[ChainNode], Optional[str], Optional[str]):
+    def analyze_volume(self, volume_name: str, execute: bool = False) -> (List[ChainNode], Optional[str], Optional[str]):
         """Returns (roots, error, phantom_image_id). error != None means the
         volume couldn't be opened - not the same as "zero descendants"."""
         try:
@@ -401,7 +607,7 @@ class DescendantReaper:
                 try:
                     flat = [d for d in img.list_descendants() if not d.get('trash', False)]
                 except Exception:
-                    flat, ok = self._walk_descendants_trash_safe(volume_name)
+                    flat, ok = self._walk_descendants_trash_safe(volume_name, execute)
                     if not ok:
                         raise RuntimeError("could not fully resolve descendants (trash-safe walk incomplete)")
         except Exception as e:
@@ -556,7 +762,7 @@ class DescendantReaper:
 
         for vol in volumes:
             print(f"\nVolume: {vol}")
-            chains, error, phantom_id = self.analyze_volume(vol)
+            chains, error, phantom_id = self.analyze_volume(vol, execute=execute)
 
             if error:
                 any_error = True
@@ -735,6 +941,8 @@ def main():
         print("\nOptional:")
         print("  MAX_CHAIN_DEPTH=N  - depth cap before forcing NEEDS_REVIEW (default: 10)")
         print("  DRY_RUN=[true/false]  - false actually deletes SAFE_TO_REMOVE chains + phantom entries (default: true)")
+        print("  CL_ORPHAN_REPAIR=[true/false]  - also auto-repair orphaned clones invisible to")
+        print("    rbd ls/trash ls (see Documentation/odf-descendant-reaper.md); requires DRY_RUN=false to act")
         print("  DEBUG=[true/false]")
         return 1
 
@@ -747,6 +955,7 @@ def main():
         return 1
 
     debug = os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
+    orphan_repair = os.environ.get('CL_ORPHAN_REPAIR', 'false').lower() in ['true', '1', 'yes']
 
     if cleanup_list_file:
         target_desc = f"image list from {cleanup_list_file}"
@@ -758,6 +967,7 @@ def main():
     print(f"  Target: {target_desc}")
     print(f"  Max chain depth: {MAX_CHAIN_DEPTH}")
     print(f"  Dry Run: {'YES' if dry_run else 'NO'}")
+    print(f"  Orphan repair: {'YES' if orphan_repair else 'NO'}")
     print(f"  Debug: {'YES' if debug else 'NO'}")
     print("")
 
@@ -765,9 +975,12 @@ def main():
         print("WARNING: LIVE MODE ENABLED - chains classified SAFE_TO_REMOVE and confirmed")
         print("phantom entries will actually be deleted. NEEDS_REVIEW / undiagnosed")
         print("errors are still never touched.")
+        if orphan_repair:
+            print("CL_ORPHAN_REPAIR is ON - orphaned clones invisible to rbd ls/trash ls will")
+            print("also be auto-repaired when found. See Documentation/odf-descendant-reaper.md.")
         print("")
 
-    reaper = DescendantReaper(debug=debug)
+    reaper = DescendantReaper(debug=debug, orphan_repair=orphan_repair)
     if not reaper.connect():
         return 1
 

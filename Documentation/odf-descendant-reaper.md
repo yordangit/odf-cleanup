@@ -93,7 +93,16 @@ graph TD
 
 #### `_direct_children_trash_safe()` / `_walk_descendants_trash_safe()`
 **When:** `list_descendants()` fails outright (trash-namespace snapshot on the image)
-**Does:** `_direct_children_trash_safe()` gets one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (trash-namespace snaps are only reachable by id); `_walk_descendants_trash_safe()` repeats this recursively since `list_children2()` is single-level, unlike `list_descendants()`. Both return `(children, ok)` - `ok=False` means at least one snapshot's children couldn't be listed (confirmed against real cluster output that `list_children2()` can throw the same ENOENT even via `set_snap_by_id()`) - this must surface as an `error`, never as "confirmed no children"
+**Does:** `_direct_children_trash_safe()` gets one level of children via `set_snap()`/`set_snap_by_id()` per snapshot + `list_children2()` (trash-namespace snaps are only reachable by id); `_walk_descendants_trash_safe()` repeats this recursively since `list_children2()` is single-level, unlike `list_descendants()`. Both return `(children, ok)` - `ok=False` means at least one snapshot's children couldn't be listed (confirmed against real cluster output that `list_children2()` can throw the same ENOENT even via `set_snap_by_id()`) - this must surface as an `error`, never as "confirmed no children". When `list_children2()` throws on a trash-namespace snapshot and `CL_ORPHAN_REPAIR=true`, tries `_diagnose_and_repair_orphan()` before giving up - see "Orphaned Clone Repair" below.
+
+#### `_diagnose_and_repair_orphan()` / `_repair_orphaned_clone()` / `_rollback_orphan_relink()`
+**When:** `CL_ORPHAN_REPAIR=true` and `list_children2()` failed on a trash-namespace snapshot
+**Purpose:** Handles a real, live corruption class - see "Orphaned Clone Repair" under Workflow Decisions for the full story and the manual procedure this automates
+**Does:**
+- `_diagnose_and_repair_orphan()`: reads the parent's `rbd_header`'s `snap_children_<hex snapid>` omap value directly (`_get_omap_value()`, bypassing `list_children2()`/`list_descendants()` entirely) and decodes it (`_decode_child_image_specs()`) to find the real child image id(s) RBD's clone-v2 tracking still references
+- `_repair_orphaned_clone()`: confirms the candidate id matches the pattern (header exists, no `rbd_directory` entry, not in `rbd trash ls`, itself childless/snapshot-free/unwatched - re-verified through the *normal* API after relinking, never trusted from raw omap alone), then temporarily relinks it into `rbd_directory` under `orphan-recovery-<id>`, removes it via `rbd.RBD().remove()` (correctly triggers the parent-side child-detach), and lets the now-childless trashed snapshot auto-purge on its own
+- `_rollback_orphan_relink()`: undoes the temporary relink (never touches the real header/data) whenever any check fails partway through - only ever reached in the failure paths, and doesn't get called at all when the repair succeeds since the image itself is gone by then
+- Only executes writes when `execute=True` (i.e. `DRY_RUN=false`); otherwise just prints the diagnosis
 
 #### `_inspect_node()`
 **Does:**
@@ -191,6 +200,7 @@ python3 utils/odf-descendant-reaper.py
 
 **Optional:**
 - `MAX_CHAIN_DEPTH` - depth cap before forcing `NEEDS_REVIEW` (default: 10)
+- `CL_ORPHAN_REPAIR` - also auto-repair orphaned clones invisible to `rbd ls`/`rbd trash ls` (default: false); requires `DRY_RUN=false` to actually act - see "Orphaned Clone Repair" below
 - `DEBUG` - verbose diagnostics, e.g. filtered-watcher details
 
 ---
@@ -249,3 +259,33 @@ Execute mode only ever acts on causes it has fully diagnosed - anything it can't
 
 #### **Key Point:**
 This mode is deliberately dumb about *why* something is safe (that's `odf-oc-compare.py`'s job) and only responsible for confirming it's *still* safe right now.
+
+### Orphaned Clone Repair Decision
+
+#### Background: what an "orphaned clone" is
+A third corruption class, distinct from phantom entries. `rbd_header.<id>` genuinely exists (valid `parent` pointer, real data) but the image has **no `rbd_directory` entry** (neither `name_`/`id_` key) and is **not in `rbd trash ls`** either. That makes it invisible to `rbd ls`, `list_children2()`, and `list_descendants()` - but its parent's own clone-v2 bookkeeping still references it, so the parent's trashed snapshot removal fails with `EBUSY` ("image is busy") while every discovery API reports zero children. Likely cause: a prior deletion attempt was interrupted between "unlink from directory" and "remove header".
+
+#### Manual diagnosis procedure (what the automated repair does under the hood)
+1. Confirm the symptom: `list_descendants()` throws, `_walk_descendants_trash_safe()` also returns `ok=False` on a trash-namespace snapshot even via `set_snap_by_id()` + `list_children2()`.
+2. Get that snapshot's numeric id (from `rbd snap ls --all --format json` on the parent) and its own image id (`rbd info`).
+3. Read the real child pointer directly, bypassing every listing API: `rados -p <pool> listomapkeys rbd_header.<parent_id>` should show a `snap_children_<snapid in 16-digit hex>` key; `rados -p <pool> getomapval rbd_header.<parent_id> snap_children_<hex> - | xxd` dumps its value.
+4. Decode the value: 4-byte LE count, then per entry: 2-byte struct version header (unused), 4-byte LE body length, 8-byte LE `pool_id`, 4-byte-length-prefixed `image_id` string, 4-byte-length-prefixed `pool_namespace` string. (Byte layout reverse-engineered against 3 real cases, not from Ceph source - re-verify if it ever stops matching. See `_decode_child_image_specs()`.)
+5. Confirm the extracted `image_id` matches the pattern: `rados -p <pool> getomapval rbd_directory id_<image_id> -` → "No such key"; `rbd trash ls -p <pool> --all --format json` → not present; `rados -p <pool> stat rbd_header.<image_id>` → exists.
+6. Confirm it's a safe leaf: `rados -p <pool> listomapkeys rbd_header.<image_id>` should show **no** `snap_children_*` or `snapshot_*` keys (no children/snapshots of its own).
+7. Temporarily relink it: write `rbd_directory`'s `name_orphan-recovery-<id>` (value: length-prefixed `<id>`) and `id_<id>` (value: length-prefixed `orphan-recovery-<id>`) omap keys, plus a matching `rbd_id.orphan-recovery-<id>` object (same encoding as the `name_` value) - same length-prefixed-string format `rbd_directory`/`rbd_id.<name>` already use for real images (verify against a known-good image's entries first, byte-for-byte, before writing anything).
+8. Verify via the *normal* API: `rbd info <pool>/orphan-recovery-<id>` should now show the expected `parent`, `snapshot_count: 0`; `rbd status` should show zero watchers; `rbd children --all` should be empty.
+9. `rbd rm <pool>/orphan-recovery-<id>` - this is the only genuinely destructive step, and only reachable once steps 5-8 all confirm the pattern.
+10. Confirm the parent's `snap_children_<hex>` key is now gone, then retry the originally-blocked snapshot removal - it may already have auto-purged as a side effect of step 9 (`ENOENT` on retry then means success, not a new failure).
+
+#### Decision Mechanisms:
+- **Confirmed pattern:** header exists, no directory entry, not in trash, itself childless/snapshot-free/unwatched (re-verified through the normal API post-relink, not trusted from raw omap alone)
+- **Depth limit:** only ever handles a single level automatically - if the orphan itself turns out to have its own children/snapshots, stop and report what was found rather than recursing
+- **Any check fails → roll back** the temporary relink immediately (`_rollback_orphan_relink()`) and fall through to `NEEDS_REVIEW`, same as any other unresolvable case
+
+#### Strategy:
+- **Opt-in only** (`CL_ORPHAN_REPAIR=true`, separate from `DRY_RUN=false`) - this writes to `rbd_directory`, even temporarily, which is a materially different risk than anything else the reaper does; it should never fire as a side effect of a routine run someone kicks off without knowing this exists
+- **Reaper-only, not ported to `odf-cleanup.py`/`_odf-cleanup.sh`** - too invasive for an unattended, auto-triggered job; this is exactly the "extreme case" tier the reaper exists for, while `odf-cleanup.py` handles normal operation
+- Diagnosis (reading the omap value, decoding it, printing what was found) always runs when `CL_ORPHAN_REPAIR=true`, regardless of `DRY_RUN` - only the actual relink/remove is gated on `execute=True`
+
+#### **Key Point:**
+Confirmed and fixed live against a real cluster (see git history / session notes for the full trace): the orphan was found, the byte format was validated against two known-good relationships before trusting the decode of the mystery one, and the repair correctly cleared an `EBUSY` that had been blocking a GUID's entire cleanup chain.
