@@ -5,7 +5,7 @@ The `odf-oc-compare.py` script compares OpenShift namespaces with ODF (OpenShift
 
 ## Execution Flow
 ```
-main() → OdfOpenShiftComparator.run_comparison() → connect_odf() → discover_namespace_guids() → discover_volume_snapshot_contents() → discover_persistent_volumes() → discover_odf_guids() → compare_and_find_orphans() → generate_report() → generate_cleanup_script()
+main() → OdfOpenShiftComparator.run_comparison() → connect_odf() → discover_namespace_guids() → discover_volume_snapshot_contents() → discover_persistent_volumes() → discover_odf_guids() → compare_and_find_orphans() → check_empty_labs() → generate_report() → generate_cleanup_script()
 ```
 
 ### High-Level Execution Flow Diagram
@@ -17,7 +17,8 @@ graph TD
     B2 --> B3["Discover PersistentVolumes (non-fatal)"]
     B3 --> C["Discover ODF GUIDs"]
     C --> D["Compare & Find Orphans"]
-    D --> E["Generate Report"]
+    D --> D2["Check Empty Labs (PVCs)"]
+    D2 --> E["Generate Report"]
     E --> F["Generate Cleanup Script"]
     F --> G["Complete Analysis"]
 ```
@@ -42,6 +43,8 @@ graph TD
 - `parentless_csi_snaps` / `parentless_csi_vols` - Analysis of csi-snaps/csi-vols without parents
 - `volume_snapshot_contents` - Cluster's `VolumeSnapshotContent` objects, used to verify real ownership of parentless csi-snaps; `None` means "couldn't load" (callers fail safe into REVIEW), `[]` means "loaded, none exist"
 - `persistent_volumes` - Cluster's `PersistentVolume` objects, same idea but for parentless csi-vols (matched via `spec.csi.volumeHandle`)
+- `guid_to_namespaces` - Maps each active namespace GUID to the namespace name(s) it was found in
+- `empty_labs` - Active namespace GUIDs with zero ODF footprint, checked against real OCP PVCs (see `check_empty_labs()`)
 
 ---
 
@@ -117,6 +120,15 @@ graph TD
 #### Analysis Helper Methods:
 - `_count_odf_items_for_guid()` - Counts volumes, snapshots, and trash items per GUID
 - `_order_guids_by_complexity()` - Orders orphaned GUIDs by cleanup complexity
+
+#### `check_empty_labs()`
+**When:** After `compare_and_find_orphans()`
+**Purpose:** For active namespace GUIDs with zero ODF footprint, confirms they're genuinely empty rather than a scan gap
+**Does:**
+- Computes `active_namespace_guids - odf_guids`
+- For each such GUID's namespace(s), lists PVCs via the Kubernetes `CoreV1Api`
+- Zero PVCs across all its namespaces → `CONFIRMED EMPTY`; any PVCs found → `HAS PVCS - REVIEW` (unexpected - investigate); listing failure → `ERROR - could not check PVCs`
+- Populates `empty_labs`
 
 ### Phase 4: Reporting
 
@@ -280,3 +292,16 @@ Script generation defaults to actually completing the cleanup rather than just p
 
 #### **Key Point:**
 Parentless analysis no longer treats "zero RBD children" as sufficient grounds for deletion - it cross-checks real Kubernetes ownership first (`VolumeSnapshotContent.snapshotHandle` for snapshots, `PersistentVolume.spec.csi.volumeHandle` for volumes - both verified to carry the same UUID as the RBD image name), since an image can still be referenced by a live k8s object without ever having been cloned.
+
+### Empty Lab Verification Decision
+
+#### Background:
+`active_namespace_guids - odf_guids` can be non-trivial (e.g. dozens of GUIDs) - namespaces exist with no matching ODF volume at all. This could mean the lab genuinely never provisioned storage, or it could be a sign of a scanning gap.
+
+#### Decision Mechanisms:
+- **PVC Check:** List PVCs in each such GUID's namespace(s) via `CoreV1Api`
+- **Zero PVCs:** Confirms the lab is genuinely empty - not just missed by the ODF-side scan
+- **Any PVCs Found:** Flags for manual review instead of assuming empty - this pool is the only one the provisioner uses, so PVCs with no matching ODF GUID are unexpected and worth investigating directly
+
+#### **Key Point:**
+This check is about **confidence, not cleanup** - there's nothing to delete here (no ODF volumes exist for these GUIDs), it just confirms the "no footprint" GUIDs are legitimately empty rather than silently trusting a difference of two sets.

@@ -47,6 +47,7 @@ class OdfOpenShiftComparator:
         # Results
         self.active_namespace_guids: Set[str] = set()
         self.all_namespace_names: Set[str] = set()
+        self.guid_to_namespaces: Dict[str, List[str]] = {}
         self.odf_guids: Set[str] = set()
         self.orphaned_guids: Set[str] = set()
 
@@ -67,6 +68,10 @@ class OdfOpenShiftComparator:
         # Track parentless CSI snapshots/volumes and their children analysis
         self.parentless_csi_snaps: Dict[str, Dict] = {}  # {snap_name: {children: [...], child_guids: [...], analysis: ...}}
         self.parentless_csi_vols: Dict[str, Dict] = {}
+
+        # Active namespace GUIDs with zero ODF footprint (checked against k8s
+        # PVCs to confirm they're genuinely empty, not just missed by the scan).
+        self.empty_labs: Dict[str, Dict] = {}
         
         # Cache expensive operations to avoid repeated RBD calls
         self._cached_ordered_guids: Optional[List[tuple]] = None
@@ -149,6 +154,7 @@ class OdfOpenShiftComparator:
                 if match:
                     guid = match.group(1)
                     self.active_namespace_guids.add(guid)
+                    self.guid_to_namespaces.setdefault(guid, []).append(namespace_name)
                     if self.debug:
                         print(f"    Found GUID: {guid} (from namespace: {namespace_name})")
             
@@ -591,7 +597,47 @@ class OdfOpenShiftComparator:
                 print(f"    Active GUIDs: {sorted(self.active_namespace_guids)}")
             if self.odf_guids:
                 print(f"    ODF GUIDs: {sorted(self.odf_guids)}")
-    
+
+    def check_empty_labs(self):
+        """For active namespace GUIDs with zero ODF footprint, check OCP for
+        PVCs to confirm they're genuinely empty rather than a scan gap."""
+        no_footprint_guids = self.active_namespace_guids - self.odf_guids
+        if not no_footprint_guids:
+            return
+
+        print(f"\nChecking {len(no_footprint_guids)} active lab(s) with no ODF footprint against OCP PVCs...")
+        try:
+            core_api = client.CoreV1Api()
+        except Exception as e:
+            print(f"[x] Error creating Kubernetes client: {e}")
+            for guid in no_footprint_guids:
+                self.empty_labs[guid] = {
+                    'namespaces': self.guid_to_namespaces.get(guid, []),
+                    'pvc_counts': {},
+                    'status': 'ERROR - could not check PVCs',
+                }
+            return
+
+        for guid in no_footprint_guids:
+            namespaces = self.guid_to_namespaces.get(guid, [])
+            pvc_counts = {}
+            status = 'CONFIRMED EMPTY'
+            for ns in namespaces:
+                try:
+                    pvcs = core_api.list_namespaced_persistent_volume_claim(ns)
+                    pvc_counts[ns] = len(pvcs.items)
+                    if pvc_counts[ns] > 0:
+                        status = 'HAS PVCS - REVIEW'
+                except Exception as e:
+                    pvc_counts[ns] = None
+                    status = 'ERROR - could not check PVCs'
+                    if self.debug:
+                        print(f"  Warning: could not list PVCs in namespace {ns}: {e}")
+            self.empty_labs[guid] = {'namespaces': namespaces, 'pvc_counts': pvc_counts, 'status': status}
+
+        confirmed = sum(1 for a in self.empty_labs.values() if a['status'] == 'CONFIRMED EMPTY')
+        print(f"  Confirmed empty: {confirmed} / {len(no_footprint_guids)}")
+
     def generate_report(self):
         """Generate detailed comparison report"""
         print("\n" + "="*80)
@@ -661,6 +707,19 @@ class OdfOpenShiftComparator:
             print("[v] No parentless csi-vol volumes found")
 
         print()
+
+        # Active labs with no ODF footprint, checked against OCP PVCs
+        if self.empty_labs:
+            print("ACTIVE LABS WITH NO ODF FOOTPRINT (checked against OCP PVCs):")
+            for guid, info in sorted(self.empty_labs.items()):
+                ns_str = ', '.join(info['namespaces']) if info['namespaces'] else '(namespace not found)'
+                print(f"  {guid}: {ns_str}")
+                print(f"    Status: {info['status']}")
+                for ns, count in info['pvc_counts'].items():
+                    print(f"    PVCs in {ns}: {count if count is not None else 'error'}")
+            print()
+
+        print()
         
         # Summary at the bottom
         print("SUMMARY:")
@@ -671,6 +730,7 @@ class OdfOpenShiftComparator:
         print(f"  ODF Trash Items: {self.stats['odf_trash_items_found']}")
         print(f"  Unique ODF GUIDs: {self.stats['unique_odf_guids']}")
         print(f"  Orphaned GUIDs: {self.stats['orphaned_guids']}")
+        print(f"  Active Labs With No ODF Footprint: {len(self.empty_labs)}")
         print(f"  Parentless CSI Snapshots: {len(self.parentless_csi_snaps)}")
         print(f"  Parentless CSI Volumes: {len(self.parentless_csi_vols)}")
         
@@ -949,6 +1009,7 @@ fi
             
             # Compare and analyze
             self.compare_and_find_orphans()
+            self.check_empty_labs()
             
             # Generate reports
             self.generate_report()

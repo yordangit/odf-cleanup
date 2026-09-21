@@ -19,6 +19,7 @@ The `odf-oc-compare.py` script compares active OpenShift namespaces with ODF RBD
 - **Namespace Analysis**: Discovers active lab GUIDs from OpenShift projects (pattern: `sandbox-{GUID}-*`)
 - **ODF Resource Discovery**: Analyzes volumes, CSI snapshots, and trash items
 - **Parentless CSI Snapshot Analysis**: Identifies potential boot/base images by analyzing children relationships
+- **Empty Lab Verification**: For active namespaces with zero ODF footprint, checks real OCP PVCs to confirm they're genuinely empty rather than a scanning gap
 - **Smart Ordering**: Prioritizes cleanup by complexity (volumes only → volumes+snapshots → volumes+snapshots+trash)
 - **Automated Script Generation**: Creates ready-to-run cleanup scripts
 
