@@ -1135,7 +1135,7 @@ remove_empty_namespace() {{
     export CL_RBD_NAMESPACE="$ns"
 
     if python3 "$ODF_REAPER"; then
-        echo "[v] Removed empty RBD namespace: $ns"
+        echo "[v] $ns removed - confirmed empty, GUID didn't match an active OCP namespace when scanned"
     else
         echo "[x] Failed to remove RBD namespace: $ns - see output above"
         echo "empty RBD namespace: $ns" >> "$NEEDS_REVIEW_FILE"
