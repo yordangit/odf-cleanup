@@ -51,6 +51,15 @@ class OdfOpenShiftComparator:
         self.odf_guids: Set[str] = set()
         self.orphaned_guids: Set[str] = set()
 
+        # RBD namespaces within the pool (Ceph multi-tenancy feature, distinct
+        # from k8s namespaces) - some provisioners isolate a lab's images into
+        # their own RBD namespace instead of the pool's default (''). Always
+        # includes '' (default). odf_guid_namespace tracks which namespace
+        # each ODF-side GUID's images were actually found in.
+        self.rbd_namespaces: List[str] = ['']
+        self.odf_guid_namespace: Dict[str, str] = {}
+        self._current_rbd_namespace: str = ''
+
         # VolumeSnapshotContent objects, used to check real Kubernetes ownership
         # of parentless CSI snapshots (a csi-snap can have zero RBD children and
         # still be actively backing a live VolumeSnapshot). None means "couldn't
@@ -75,8 +84,9 @@ class OdfOpenShiftComparator:
         
         # Cache expensive operations to avoid repeated RBD calls
         self._cached_ordered_guids: Optional[List[tuple]] = None
-        self._cached_all_images: Optional[List[str]] = None
-        self._cached_trash_items: Optional[List] = None
+        self._cached_namespaced_guids: Optional[Dict[str, List[str]]] = None
+        self._cached_all_images: Optional[List[tuple]] = None  # [(rbd_namespace, image_name), ...]
+        self._cached_trash_items: Optional[List[tuple]] = None  # [(rbd_namespace, trash_item_dict), ...]
         
         # Statistics
         self.stats = {
@@ -120,6 +130,20 @@ class OdfOpenShiftComparator:
             return False
         except Exception as e:
             print(f"[x] Error connecting to ODF cluster: {e}")
+            return False
+
+    def discover_rbd_namespaces(self) -> bool:
+        """Discover RBD namespaces within the pool, fallback to scanning the default namespace"""
+        print("Discovering RBD namespaces in pool...")
+        try:
+            named = list(rbd.RBD().namespace_list(self.ioctx))
+            self.rbd_namespaces = [''] + named
+            print(f"  Found {len(named)} named RBD namespace(s), plus the default namespace")
+            return True
+        except Exception as e:
+            print(f"[x] Error listing RBD namespaces: {e}")
+            print("  Falling back to the default namespace only - images in named RBD namespaces will be invisible")
+            self.rbd_namespaces = ['']
             return False
     
     def discover_namespace_guids(self) -> bool:
@@ -203,49 +227,71 @@ class OdfOpenShiftComparator:
             return False
 
     def discover_odf_guids(self) -> bool:
-        """Discover all lab GUIDs from ODF RBD images"""
+        """Discover all lab GUIDs from ODF RBD images, across every RBD
+        namespace in the pool (see discover_rbd_namespaces())."""
         print("Discovering lab GUIDs from ODF RBD images...")
-        
+
+        self._cached_all_images = []
+        self._cached_trash_items = []
+        total_images = 0
+        total_trash = 0
+
         try:
-            # Get all RBD images in pool
-            all_images = rbd.RBD().list(self.ioctx)
-            # Cache for reuse in counting operations
-            self._cached_all_images = all_images
-            
-            # Get all trash items (convert iterator to list)
-            trash_items = list(rbd.RBD().trash_list(self.ioctx))
-            # Cache for reuse in counting operations
-            self._cached_trash_items = trash_items
-            
-            if self.debug:
-                print(f"  Found {len(all_images)} active images, {len(trash_items)} trash items")
-            
-            # Process active images
-            for img_name in all_images:
-                self._extract_guid_from_image(img_name, "active")
-            
-            # Process trash items
-            for item in trash_items:
-                self._extract_guid_from_image(item['name'], "trash")
-            
+            for ns in self.rbd_namespaces:
+                self.ioctx.set_namespace(ns)
+                self._current_rbd_namespace = ns
+
+                all_images = rbd.RBD().list(self.ioctx)
+                trash_items = list(rbd.RBD().trash_list(self.ioctx))
+                self._cached_all_images.extend((ns, name) for name in all_images)
+                self._cached_trash_items.extend((ns, item) for item in trash_items)
+                total_images += len(all_images)
+                total_trash += len(trash_items)
+
+                if self.debug:
+                    label = ns if ns else '(default)'
+                    print(f"  [{label}] {len(all_images)} active images, {len(trash_items)} trash items")
+
+                for img_name in all_images:
+                    self._extract_guid_from_image(img_name, "active")
+                for item in trash_items:
+                    self._extract_guid_from_image(item['name'], "trash")
+
+            self.ioctx.set_namespace('')
+            self._current_rbd_namespace = ''
+
             # Report CSI snapshot processing results
-            total_csi_snaps = len([name for name in all_images if 'csi-snap' in name])
+            total_csi_snaps = len([name for ns, name in self._cached_all_images if 'csi-snap' in name])
             cached_csi_snaps = len(self.csi_snap_guid_cache)
             if self.debug and total_csi_snaps > 0:
                 print(f"  Processed {cached_csi_snaps} CSI snapshots for parent lookup")
-            
+
             self.stats['unique_odf_guids'] = len(self.odf_guids)
-            print(f"  Found {self.stats['unique_odf_guids']} unique lab GUIDs in ODF")
+            print(f"  Found {self.stats['unique_odf_guids']} unique lab GUIDs in ODF "
+                  f"(across {len(self.rbd_namespaces)} RBD namespace(s), {total_images} images, {total_trash} trash items)")
             print(f"    Active volumes: {self.stats['odf_volumes_found']}")
             print(f"    CSI snapshots: {self.stats['odf_csi_snaps_found']}")
             print(f"    Trash items: {self.stats['odf_trash_items_found']}")
-            
+
             return True
-            
+
         except Exception as e:
             print(f"[x] Error discovering ODF images: {e}")
+            self.ioctx.set_namespace('')
+            self._current_rbd_namespace = ''
             return False
     
+    def _record_odf_guid(self, guid: str):
+        """Add guid to odf_guids and remember which RBD namespace it was
+        found in (first-seen wins; a lab's images shouldn't span namespaces)."""
+        self.odf_guids.add(guid)
+        existing = self.odf_guid_namespace.get(guid)
+        if existing is None:
+            self.odf_guid_namespace[guid] = self._current_rbd_namespace
+        elif self.debug and existing != self._current_rbd_namespace:
+            print(f"    Warning: GUID {guid} seen in both RBD namespace "
+                  f"'{existing}' and '{self._current_rbd_namespace}'")
+
     def _extract_guid_from_image(self, img_name: str, source: str):
         """Extract GUID from an ODF image name"""
         try:
@@ -255,7 +301,7 @@ class OdfOpenShiftComparator:
             
             if match:
                 guid = match.group(1)
-                self.odf_guids.add(guid)
+                self._record_odf_guid(guid)
                 
                 if source == "active":
                     if 'csi-snap' in img_name:
@@ -273,7 +319,7 @@ class OdfOpenShiftComparator:
             if 'csi-snap' in img_name and source == "active":
                 guid = self._get_guid_from_csi_snap_parent(img_name)
                 if guid:
-                    self.odf_guids.add(guid)
+                    self._record_odf_guid(guid)
                     self.stats['odf_csi_snaps_found'] += 1
                     if self.debug:
                         print(f"    Found GUID: {guid} (from CSI snap parent: {img_name})")
@@ -283,7 +329,7 @@ class OdfOpenShiftComparator:
             if 'csi-vol' in img_name and source == "active":
                 guid = self._get_guid_from_csi_vol_parent(img_name)
                 if guid:
-                    self.odf_guids.add(guid)
+                    self._record_odf_guid(guid)
                     self.stats['odf_volumes_found'] += 1
                     if self.debug:
                         print(f"    Found GUID: {guid} (from CSI vol parent: {img_name})")
@@ -399,7 +445,8 @@ class OdfOpenShiftComparator:
             'total_children': 0,
             'has_active_children': False,
             'recommendation': 'unknown',
-            'k8s_check': None
+            'k8s_check': None,
+            'rbd_namespace': self._current_rbd_namespace,
         }
         
         try:
@@ -513,7 +560,8 @@ class OdfOpenShiftComparator:
             'total_children': 0,
             'has_active_children': False,
             'recommendation': 'unknown',
-            'k8s_check': None
+            'k8s_check': None,
+            'rbd_namespace': self._current_rbd_namespace,
         }
 
         try:
@@ -600,7 +648,10 @@ class OdfOpenShiftComparator:
 
     def check_empty_labs(self):
         """For active namespace GUIDs with zero ODF footprint, check OCP for
-        PVCs to confirm they're genuinely empty rather than a scan gap."""
+        PVCs to confirm they're genuinely empty rather than a scan gap.
+        PVCs backed by a pool other than CL_POOL (e.g. bastion/extra-disk
+        volumes on a separate cephblockpool) are out of scope for this tool
+        and don't count as suspicious - only same-pool PVCs need REVIEW."""
         no_footprint_guids = self.active_namespace_guids - self.odf_guids
         if not no_footprint_guids:
             return
@@ -613,27 +664,50 @@ class OdfOpenShiftComparator:
             for guid in no_footprint_guids:
                 self.empty_labs[guid] = {
                     'namespaces': self.guid_to_namespaces.get(guid, []),
-                    'pvc_counts': {},
+                    'pvcs': [],
                     'status': 'ERROR - could not check PVCs',
                 }
             return
 
+        # Index PVs by name once, so each PVC's real backing pool can be
+        # looked up via spec.csi.volumeAttributes.pool. None means PVs
+        # couldn't be loaded at all - pool lookups just stay unknown.
+        pv_by_name = None
+        if self.persistent_volumes is not None:
+            pv_by_name = {(pv.get('metadata') or {}).get('name'): pv for pv in self.persistent_volumes}
+
         for guid in no_footprint_guids:
             namespaces = self.guid_to_namespaces.get(guid, [])
-            pvc_counts = {}
-            status = 'CONFIRMED EMPTY'
+            pvcs = []
+            list_error = False
             for ns in namespaces:
                 try:
-                    pvcs = core_api.list_namespaced_persistent_volume_claim(ns)
-                    pvc_counts[ns] = len(pvcs.items)
-                    if pvc_counts[ns] > 0:
-                        status = 'HAS PVCS - REVIEW'
+                    result = core_api.list_namespaced_persistent_volume_claim(ns)
                 except Exception as e:
-                    pvc_counts[ns] = None
-                    status = 'ERROR - could not check PVCs'
+                    list_error = True
                     if self.debug:
                         print(f"  Warning: could not list PVCs in namespace {ns}: {e}")
-            self.empty_labs[guid] = {'namespaces': namespaces, 'pvc_counts': pvc_counts, 'status': status}
+                    continue
+                for pvc in result.items:
+                    pool = None
+                    if pv_by_name is not None and pvc.spec.volume_name:
+                        pv = pv_by_name.get(pvc.spec.volume_name)
+                        if pv:
+                            csi = (pv.get('spec') or {}).get('csi') or {}
+                            pool = (csi.get('volume_attributes') or {}).get('pool')
+                    pvcs.append({'name': pvc.metadata.name, 'namespace': ns,
+                                 'phase': pvc.status.phase, 'pool': pool})
+
+            if not pvcs:
+                status = 'ERROR - could not check PVCs' if list_error else 'CONFIRMED EMPTY'
+            elif any(p['pool'] == self.pool_name for p in pvcs):
+                status = 'HAS PVCS - REVIEW (same pool as ODF scan, but no matching GUID found)'
+            elif all(p['pool'] is not None and p['pool'] != self.pool_name for p in pvcs):
+                status = 'HAS PVCS - DIFFERENT POOL (not scanned by this tool)'
+            else:
+                status = 'HAS PVCS - REVIEW (could not verify pool for one or more PVCs)'
+
+            self.empty_labs[guid] = {'namespaces': namespaces, 'pvcs': pvcs, 'status': status}
 
         confirmed = sum(1 for a in self.empty_labs.values() if a['status'] == 'CONFIRMED EMPTY')
         print(f"  Confirmed empty: {confirmed} / {len(no_footprint_guids)}")
@@ -647,24 +721,38 @@ class OdfOpenShiftComparator:
         print(f"ODF Pool: {self.pool_name}")
         print()
         
-        # Orphaned GUIDs detail (ordered by complexity)
+        # Orphaned GUIDs detail (ordered by complexity) - default RBD namespace only
         if self.orphaned_guids:
-            print("ORPHANED GUIDS (ordered by cleanup complexity):")
             ordered_guids = self._order_guids_by_complexity()
             # Cache for reuse in cleanup script generation
             self._cached_ordered_guids = ordered_guids
-            
-            current_category = None
-            for guid, category, counts in ordered_guids:
-                if category != current_category:
-                    if current_category is not None:
-                        print()
-                    print(f"  {category.upper()}:")
-                    current_category = category
-                
-                print(f"    {guid}: {counts['total']} items " +
-                      f"({counts['volumes']} volumes, {counts['snaps']} snaps, " +
-                      f"{counts['trash']} trash)")
+            namespaced_guids = self._group_namespaced_guids()
+            self._cached_namespaced_guids = namespaced_guids
+
+            if ordered_guids:
+                print("ORPHANED GUIDS (ordered by cleanup complexity):")
+                current_category = None
+                for guid, category, counts in ordered_guids:
+                    if category != current_category:
+                        if current_category is not None:
+                            print()
+                        print(f"  {category.upper()}:")
+                        current_category = category
+
+                    print(f"    {guid}: {counts['total']} items " +
+                          f"({counts['volumes']} volumes, {counts['snaps']} snaps, " +
+                          f"{counts['trash']} trash)")
+                print()
+
+            if namespaced_guids:
+                print("ORPHANED GUIDS IN NAMED RBD NAMESPACES (require odf-descendant-reaper.py, not odf-cleanup.py):")
+                for ns, guids in namespaced_guids.items():
+                    print(f"  {ns}:")
+                    for guid in guids:
+                        counts = self._count_odf_items_for_guid(guid)
+                        print(f"    {guid}: {counts['total']} items " +
+                              f"({counts['volumes']} volumes, {counts['snaps']} snaps, " +
+                              f"{counts['trash']} trash)")
         else:
             print("[v] No orphaned GUIDs found - all ODF volumes have active namespaces")
         
@@ -715,8 +803,9 @@ class OdfOpenShiftComparator:
                 ns_str = ', '.join(info['namespaces']) if info['namespaces'] else '(namespace not found)'
                 print(f"  {guid}: {ns_str}")
                 print(f"    Status: {info['status']}")
-                for ns, count in info['pvc_counts'].items():
-                    print(f"    PVCs in {ns}: {count if count is not None else 'error'}")
+                for pvc in info['pvcs']:
+                    pool_str = pvc['pool'] if pvc['pool'] else 'unknown'
+                    print(f"      {pvc['name']} ({pvc['phase']}, pool={pool_str})")
             print()
 
         print()
@@ -730,6 +819,9 @@ class OdfOpenShiftComparator:
         print(f"  ODF Trash Items: {self.stats['odf_trash_items_found']}")
         print(f"  Unique ODF GUIDs: {self.stats['unique_odf_guids']}")
         print(f"  Orphaned GUIDs: {self.stats['orphaned_guids']}")
+        namespaced_count = sum(len(g) for g in (self._cached_namespaced_guids or {}).values())
+        if namespaced_count:
+            print(f"    (of which {namespaced_count} are in named RBD namespaces - see odf-descendant-reaper.py)")
         print(f"  Active Labs With No ODF Footprint: {len(self.empty_labs)}")
         print(f"  Parentless CSI Snapshots: {len(self.parentless_csi_snaps)}")
         print(f"  Parentless CSI Volumes: {len(self.parentless_csi_vols)}")
@@ -741,13 +833,15 @@ class OdfOpenShiftComparator:
         counts = {'volumes': 0, 'snaps': 0, 'trash': 0, 'total': 0}
         
         try:
-            # Use cached images if available, otherwise fetch (shouldn't happen in normal flow)
+            # Use cached images if available, otherwise fetch from the default
+            # namespace only (shouldn't happen in normal flow - this fallback
+            # predates namespace scanning and doesn't cover named namespaces)
             if self._cached_all_images is not None:
-                all_images = self._cached_all_images
+                all_images = self._cached_all_images  # [(rbd_namespace, name), ...]
             else:
-                all_images = rbd.RBD().list(self.ioctx)
-                
-            for img_name in all_images:
+                all_images = [('', name) for name in rbd.RBD().list(self.ioctx)]
+
+            for _ns, img_name in all_images:
                 if guid in img_name:
                     if 'csi-snap' in img_name:
                         counts['snaps'] += 1
@@ -763,13 +857,14 @@ class OdfOpenShiftComparator:
                     if cached_guid == guid:
                         counts['volumes'] += 1
             
-            # Use cached trash items if available, otherwise fetch (shouldn't happen in normal flow)
+            # Use cached trash items if available, otherwise fetch from the
+            # default namespace only (see note above)
             if self._cached_trash_items is not None:
-                trash_items = self._cached_trash_items
+                trash_items = self._cached_trash_items  # [(rbd_namespace, item), ...]
             else:
-                trash_items = list(rbd.RBD().trash_list(self.ioctx))
-                
-            for item in trash_items:
+                trash_items = [('', item) for item in rbd.RBD().trash_list(self.ioctx)]
+
+            for _ns, item in trash_items:
                 if guid in item['name']:
                     counts['trash'] += 1
             
@@ -781,8 +876,20 @@ class OdfOpenShiftComparator:
         
         return counts
     
+    def _group_namespaced_guids(self) -> Dict[str, List[str]]:
+        """Orphaned GUIDs living in a named RBD namespace, grouped by namespace.
+        routes them to odf-descendant-reaper.py, with CL_RBD_NAMESPACE set."""
+        grouped: Dict[str, List[str]] = {}
+        for guid in self.orphaned_guids:
+            ns = self.odf_guid_namespace.get(guid, '')
+            if ns:
+                grouped.setdefault(ns, []).append(guid)
+        return {ns: sorted(guids) for ns, guids in sorted(grouped.items())}
+
     def _order_guids_by_complexity(self) -> List[tuple]:
-        """Order orphaned GUIDs by cleanup complexity (simple to complex)"""
+        """Order default-RBD-namespace orphaned GUIDs by cleanup complexity
+        (simple to complex). Named-namespace GUIDs are excluded here - see
+        _group_namespaced_guids(), since odf-cleanup.py can't reach them."""
         categorized_guids = {
             'priority 1 - volumes only': [],
             'priority 2 - volumes + snapshots': [],
@@ -790,6 +897,8 @@ class OdfOpenShiftComparator:
         }
         
         for guid in self.orphaned_guids:
+            if self.odf_guid_namespace.get(guid, ''):
+                continue  # named-namespace GUID, handled separately
             counts = self._count_odf_items_for_guid(guid)
             has_volumes = counts['volumes'] > 0
             has_snaps = counts['snaps'] > 0
@@ -827,42 +936,65 @@ class OdfOpenShiftComparator:
         # odf-cleanup.py can't process them. Handled separately via the reaper's
         # CL_CLEANUP_LIST mode, which re-checks watchers/children fresh before
         # removing each one (cluster state can change between analysis and now).
-        safe_csi_leftovers = sorted(
-            [n for n, a in self.parentless_csi_snaps.items() if a['recommendation'].startswith('SAFE TO DELETE')] +
-            [n for n, a in self.parentless_csi_vols.items() if a['recommendation'].startswith('SAFE TO DELETE')]
-        )
+        # Grouped by RBD namespace since the reaper only targets one namespace
+        # per run (CL_RBD_NAMESPACE) - most will be a single default-namespace group.
+        safe_csi_leftovers_by_ns: Dict[str, List[str]] = {}
+        for n, a in self.parentless_csi_snaps.items():
+            if a['recommendation'].startswith('SAFE TO DELETE'):
+                safe_csi_leftovers_by_ns.setdefault(a.get('rbd_namespace', ''), []).append(n)
+        for n, a in self.parentless_csi_vols.items():
+            if a['recommendation'].startswith('SAFE TO DELETE'):
+                safe_csi_leftovers_by_ns.setdefault(a.get('rbd_namespace', ''), []).append(n)
+        safe_csi_leftovers_by_ns = {ns: sorted(names) for ns, names in sorted(safe_csi_leftovers_by_ns.items())}
+        safe_csi_leftovers_total = sum(len(names) for names in safe_csi_leftovers_by_ns.values())
 
-        if not self.orphaned_guids and not safe_csi_leftovers:
+        if not self.orphaned_guids and not safe_csi_leftovers_total:
             print("No orphaned GUIDs or safe CSI leftovers found - no cleanup script needed")
             return
         
         print(f"\nGenerating cleanup script: {output_file}")
         
-        # Reuse cached ordering result from generate_report() - no expensive RBD calls!
-        if self._cached_ordered_guids is None:
-            # Fallback if cache not available (shouldn't happen in normal flow)
-            ordered_guids = self._order_guids_by_complexity()
-        else:
-            ordered_guids = self._cached_ordered_guids
-            
+        # Reuse cached ordering results from generate_report() - no expensive RBD calls!
+        ordered_guids = self._cached_ordered_guids if self._cached_ordered_guids is not None else self._order_guids_by_complexity()
+        namespaced_guids = self._cached_namespaced_guids if self._cached_namespaced_guids is not None else self._group_namespaced_guids()
+
         priority_1_guids = [guid for guid, cat, counts in ordered_guids if 'priority 1' in cat]
         priority_2_guids = [guid for guid, cat, counts in ordered_guids if 'priority 2' in cat]
         priority_3_guids = [guid for guid, cat, counts in ordered_guids if 'priority 3' in cat]
 
+        namespaced_guids_lines = []
+        total_namespaced = sum(len(g) for g in namespaced_guids.values())
+        if namespaced_guids:
+            namespaced_guids_lines.append(
+                f'echo "=== NAMESPACED ORPHANED GUIDS: {total_namespaced} GUID(s) across '
+                f'{len(namespaced_guids)} RBD namespace(s) (odf-descendant-reaper.py, not odf-cleanup.py) ==="'
+            )
+            for ns, guids in namespaced_guids.items():
+                namespaced_guids_lines.append(f'echo "--- RBD namespace: {ns} ---"')
+                for guid in guids:
+                    namespaced_guids_lines.append(f'process_namespaced_guid "{guid}" "{ns}"')
+        namespaced_guids_block = "\n".join(namespaced_guids_lines)
+
         csi_leftovers_block = ""
-        if safe_csi_leftovers:
-            leftover_lines = "\n".join(safe_csi_leftovers)
-            csi_leftovers_block = f'''
-echo "=== Cleaning up {len(safe_csi_leftovers)} parentless CSI leftover(s) (k8s ownership verified) ==="
-CSI_LEFTOVERS_FILE="csi_leftovers_safe_to_delete.txt"
+        if safe_csi_leftovers_by_ns:
+            blocks = []
+            for i, (ns, names) in enumerate(safe_csi_leftovers_by_ns.items(), start=1):
+                leftover_lines = "\n".join(names)
+                ns_export = f'export CL_RBD_NAMESPACE="{ns}"' if ns else 'unset CL_RBD_NAMESPACE'
+                ns_label = f" (RBD namespace: {ns})" if ns else ""
+                blocks.append(f'''
+echo "=== Cleaning up {len(names)} parentless CSI leftover(s){ns_label} (k8s ownership verified) ==="
+CSI_LEFTOVERS_FILE="csi_leftovers_safe_to_delete_{i}.txt"
 cat > "$CSI_LEFTOVERS_FILE" <<'CSILIST'
 {leftover_lines}
 CSILIST
 unset CL_LAB CL_VOLUME
+{ns_export}
 export CL_CLEANUP_LIST="$CSI_LEFTOVERS_FILE"
 python3 "$ODF_REAPER"
 echo ""
-'''
+''')
+            csi_leftovers_block = "".join(blocks)
         
         script_content = f"""#!/bin/bash
 # Generated orphaned GUID cleanup script
@@ -938,6 +1070,30 @@ process_guid() {{
     fi
 }}
 
+# odf-cleanup.py only ever operates in the pool's default RBD namespace, so
+# GUIDs living in a named namespace (see discover_rbd_namespaces()) are
+# processed via the reaper's CL_LAB chain-walking mode instead, with
+# CL_RBD_NAMESPACE set.
+process_namespaced_guid() {{
+    local guid="$1"
+    local ns="$2"
+
+    echo "=================================================="
+    echo "Cleaning up GUID: $guid (RBD namespace: $ns)"
+    echo "=================================================="
+
+    export CL_LAB="$guid"
+    export CL_RBD_NAMESPACE="$ns"
+
+    if python3 "$ODF_REAPER"; then
+        echo "[v] Processed GUID: $guid (namespace: $ns)"
+    else
+        echo "[x] Failed to fully process GUID: $guid (namespace: $ns) - see output above"
+        echo "$guid (RBD namespace: $ns)" >> "$NEEDS_REVIEW_FILE"
+    fi
+    unset CL_RBD_NAMESPACE
+}}
+
 # Cleanup loop - Priority 1: Volumes only (safest)
 echo "=== PRIORITY 1: Volumes only (safest) ==="
 for guid in $PRIORITY_1_GUIDS; do
@@ -958,6 +1114,7 @@ for guid in $PRIORITY_3_GUIDS; do
     process_guid "$guid" "Priority 3 - volumes + snapshots + trash"
     echo ""
 done
+{namespaced_guids_block}
 {csi_leftovers_block}
 echo "Cleanup script completed!"
 if [ -f "$NEEDS_REVIEW_FILE" ]; then
@@ -975,9 +1132,10 @@ fi
             os.chmod(output_file, 0o755)
             
             print(f"[v] Cleanup script created: {output_file}")
-            print(f"  Contains {len(self.orphaned_guids)} orphaned GUIDs")
-            if safe_csi_leftovers:
-                print(f"  Plus {len(safe_csi_leftovers)} parentless csi-snap/csi-vol leftover(s) (k8s ownership verified)")
+            print(f"  Contains {len(self.orphaned_guids)} orphaned GUIDs" +
+                  (f" ({total_namespaced} via odf-descendant-reaper.py in named RBD namespaces)" if total_namespaced else ""))
+            if safe_csi_leftovers_total:
+                print(f"  Plus {safe_csi_leftovers_total} parentless csi-snap/csi-vol leftover(s) (k8s ownership verified)")
             print(f"  Run with: ./{output_file}")
             print("  WARNING: DRY_RUN defaults to false - this will actually delete.")
             print("  It will prompt for confirmation before proceeding; set DRY_RUN=\"true\" in the script to preview first.")
@@ -1004,6 +1162,9 @@ fi
             self.discover_volume_snapshot_contents()
             self.discover_persistent_volumes()
 
+            # Non-fatal if this fails - falls back to scanning the default
+            # RBD namespace only (pre-existing behavior).
+            self.discover_rbd_namespaces()
             if not self.discover_odf_guids():
                 return False
             

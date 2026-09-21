@@ -69,6 +69,7 @@ graph TD
 **Does:**
 - Reads `CL_POOL`, `CL_CONF`, `CL_KEYRING`
 - Creates Rados cluster connection and IO context
+- Optionally calls `ioctx.set_namespace()` if `CL_RBD_NAMESPACE` is set - some provisioners isolate a lab's images into their own RBD namespace (Ceph multi-tenancy, distinct from k8s namespaces) instead of the pool's default. Every method below just uses `self.ioctx`, so this transparently scopes the whole run (chain-walking, `CL_VOLUME`, `CL_CLEANUP_LIST`) to that namespace - no other code changes needed
 - Captures `my_instance_id` so its own inspection watch can be filtered out of watcher lists later
 
 ### Phase 2: Target Resolution
@@ -203,6 +204,7 @@ python3 utils/odf-descendant-reaper.py
 
 **Optional:**
 - `MAX_CHAIN_DEPTH` - depth cap before forcing `NEEDS_REVIEW` (default: 10)
+- `CL_RBD_NAMESPACE` - RBD namespace within the pool (Ceph multi-tenancy, distinct from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace). Used by `odf-oc-compare.py`'s generated cleanup script for GUIDs it found living in a named namespace - `odf-cleanup.py` can't reach those (it only ever operates in the default namespace), so they're routed here instead
 - `DEBUG` - verbose diagnostics, e.g. filtered-watcher details
 
 Orphaned clone repair (see "Orphaned Clone Repair" below) has no separate toggle - diagnosis always runs when the trash-safe fallback hits an unresolvable snapshot, and the actual repair follows the same `DRY_RUN` convention as everything else in execute mode.

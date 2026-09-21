@@ -17,6 +17,9 @@ Usage:
     export DRY_RUN="false"              # actually delete what's classified/listed safe (default: true).
                                          # Also auto-repairs orphaned clones invisible to rbd ls/trash
                                          # ls when found - see Documentation/odf-descendant-reaper.md
+    export CL_RBD_NAMESPACE="ns-name"   # optional: RBD namespace within the pool (Ceph multi-tenancy,
+                                         # distinct from k8s namespaces) some provisioners use instead
+                                         # of the pool's default namespace
     python3 utils/odf-descendant-reaper.py
 
 Author:  gh:@yordangit
@@ -103,9 +106,15 @@ class DescendantReaper:
             # opening an image ourselves to inspect it registers a watch too.
             self.my_instance_id = self.cluster.get_instance_id()
 
+            # Optional: some provisioners isolate a lab's images into their
+            # own RBD namespace
+            rbd_namespace = os.environ.get('CL_RBD_NAMESPACE', '')
+            if rbd_namespace:
+                self.ioctx.set_namespace(rbd_namespace)
+
             if self.debug:
                 print(f"[v] Connected to ODF cluster: {self.cluster.get_fsid()}")
-                print(f"  Pool: {self.pool_name}")
+                print(f"  Pool: {self.pool_name}" + (f" (RBD namespace: {rbd_namespace})" if rbd_namespace else ""))
 
             return True
 
@@ -987,6 +996,8 @@ def main():
         print("  MAX_CHAIN_DEPTH=N  - depth cap before forcing NEEDS_REVIEW (default: 10)")
         print("  DRY_RUN=[true/false]  - false actually deletes SAFE_TO_REMOVE chains + phantom entries,")
         print("    and auto-repairs orphaned clones invisible to rbd ls/trash ls (default: true)")
+        print("  CL_RBD_NAMESPACE   - RBD namespace within the pool (Ceph multi-tenancy, distinct")
+        print("    from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace)")
         print("  DEBUG=[true/false]")
         return 1
 
@@ -1007,6 +1018,8 @@ def main():
 
     print("Configuration:")
     print(f"  Pool: {os.environ['CL_POOL']}")
+    if os.environ.get('CL_RBD_NAMESPACE'):
+        print(f"  RBD Namespace: {os.environ['CL_RBD_NAMESPACE']}")
     print(f"  Target: {target_desc}")
     print(f"  Max chain depth: {MAX_CHAIN_DEPTH}")
     print(f"  Dry Run: {'YES' if dry_run else 'NO'}")
