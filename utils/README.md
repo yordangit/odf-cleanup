@@ -20,7 +20,7 @@ The `odf-oc-compare.py` script compares active OpenShift namespaces with ODF RBD
 - **ODF Resource Discovery**: Analyzes volumes, CSI snapshots, and trash items
 - **Parentless CSI Snapshot Analysis**: Identifies potential boot/base images by analyzing children relationships
 - **Empty Lab Verification**: For active namespaces with zero ODF footprint, checks real OCP PVCs to confirm they're genuinely empty rather than a scanning gap
-- **RBD Namespace Awareness**: Scans every RBD namespace in the pool (Ceph multi-tenancy, distinct from k8s namespaces), not just the default one - some provisioners isolate a lab's images this way; orphans found there are routed to `odf-descendant-reaper.py` (with `CL_RBD_NAMESPACE`) instead of `odf-cleanup.py`, which can't reach them. Namespaces found completely empty are flagged too (unless their own embedded GUID still matches an active OCP namespace) and routed to the reaper for removal
+- **RBD Namespace Awareness**: Scans every RBD namespace in the pool (Ceph multi-tenancy, distinct from k8s namespaces), not just the default one - some provisioners isolate a lab's images this way; orphans found there go through the same `odf-cleanup.py` (with `CL_RBD_NAMESPACE` set), which also removes the namespace itself once empty. Namespaces found completely empty from the start (no GUID ever lived there) are flagged too (unless their own embedded GUID still matches an active OCP namespace) and routed straight to the reaper for removal
 - **Smart Ordering**: Prioritizes cleanup by complexity (volumes only → volumes+snapshots → volumes+snapshots+trash)
 - **Automated Script Generation**: Creates ready-to-run cleanup scripts
 

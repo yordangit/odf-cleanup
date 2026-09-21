@@ -195,7 +195,12 @@ sequenceDiagram
 **Does:** 
 - Reads CL_POOL, CL_CONF, CL_KEYRING, CL_LAB from environment
 - Creates Rados cluster connection and IO context
+- If `CL_RBD_NAMESPACE` is set, scopes the ioctx to that RBD namespace (Ceph multi-tenancy within the pool, distinct from k8s namespaces - some provisioners isolate a lab's images this way instead of using the pool's default namespace); optional, defaults to the pool's default namespace
 - Returns success/failure status
+
+#### `_remove_namespace_if_empty()`
+**When:** Right before `cleanup()` returns success (both the "nothing found" and "everything removed" paths)
+**Purpose:** If `CL_RBD_NAMESPACE` was set, removes the namespace itself once it's confirmed empty of images/trash - a no-op if the namespace still has content, if `CL_RBD_NAMESPACE` wasn't set, or in dry-run (preview only). Best-effort - never affects the overall return value
 
 #### `discover_images()`
 **When:** After successful connection
@@ -371,7 +376,7 @@ Phase 2: Scanning for missing descendants...
 **Purpose:** Script entry point and configuration validation
 **Does:**
 - Validates required environment variables (CL_LAB, CL_POOL, CL_CONF, CL_KEYRING)
-- Configures dry-run and debug modes
+- Configures dry-run and debug modes; optional `CL_RBD_NAMESPACE` for provisioners that isolate labs into a named RBD namespace
 - Creates OdfCleaner instance and runs cleanup
 - Returns exit code based on success/failure
 

@@ -895,8 +895,7 @@ class OdfOpenShiftComparator:
         return counts
     
     def _group_namespaced_guids(self) -> Dict[str, List[str]]:
-        """Orphaned GUIDs living in a named RBD namespace, grouped by namespace.
-        routes them to odf-descendant-reaper.py, with CL_RBD_NAMESPACE set."""
+        """Orphaned GUIDs living in a named RBD namespace, grouped by namespace"""
         grouped: Dict[str, List[str]] = {}
         for guid in self.orphaned_guids:
             ns = self.odf_guid_namespace.get(guid, '')
@@ -906,8 +905,8 @@ class OdfOpenShiftComparator:
 
     def _order_guids_by_complexity(self) -> List[tuple]:
         """Order default-RBD-namespace orphaned GUIDs by cleanup complexity
-        (simple to complex). Named-namespace GUIDs are excluded here - see
-        _group_namespaced_guids(), since odf-cleanup.py can't reach them."""
+        (simple to complex). Named-namespace GUIDs are grouped separately
+        by _group_namespaced_guids() instead."""
         categorized_guids = {
             'priority 1 - volumes only': [],
             'priority 2 - volumes + snapshots': [],
@@ -1096,10 +1095,9 @@ process_guid() {{
     fi
 }}
 
-# odf-cleanup.py only ever operates in the pool's default RBD namespace, so
-# GUIDs living in a named namespace (see discover_rbd_namespaces()) are
-# processed via the reaper's CL_LAB chain-walking mode instead, with
-# CL_RBD_NAMESPACE set.
+# GUIDs living in a named RBD namespace (see discover_rbd_namespaces()) go
+# through odf-cleanup.py too, same as process_guid(), just with
+# CL_RBD_NAMESPACE also set so it opens the right namespace.
 process_namespaced_guid() {{
     local guid="$1"
     local ns="$2"
@@ -1111,19 +1109,16 @@ process_namespaced_guid() {{
     export CL_LAB="$guid"
     export CL_RBD_NAMESPACE="$ns"
 
-    if python3 "$ODF_REAPER"; then
-        echo "[v] Processed GUID: $guid (namespace: $ns)"
+    if python3 "$ODF_CLEANUP"; then
+        echo "[v] Successfully processed GUID: $guid (namespace: $ns)"
     else
-        echo "[x] Failed to fully process GUID: $guid (namespace: $ns) - see output above"
+        echo "[x] Failed to process GUID: $guid (namespace: $ns) - logged for manual review (try: CL_LAB=$guid CL_RBD_NAMESPACE=$ns python3 $ODF_REAPER)"
         echo "$guid (RBD namespace: $ns)" >> "$NEEDS_REVIEW_FILE"
     fi
     unset CL_RBD_NAMESPACE
 }}
 
-# A named RBD namespace found completely empty (no images/trash at all) -
-# no GUID lives here to trigger cleanup via process_namespaced_guid above,
-# so it needs its own direct call into the reaper's namespace-only mode
-# (CL_RBD_NAMESPACE set, no CL_LAB/CL_VOLUME/CL_CLEANUP_LIST).
+# Removes a named RBD namespace that was already empty of images/trash
 remove_empty_namespace() {{
     local ns="$1"
 

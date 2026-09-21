@@ -196,6 +196,9 @@ pip install kubernetes
 ### Required for Cleanup Script Only
 - `CL_LAB` - LAB GUID to clean up
 
+### Optional for Cleanup Script Only
+- `CL_RBD_NAMESPACE` - RBD namespace within the pool (Ceph multi-tenancy, distinct from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace)
+
 ### Optional for Both Scripts
 - `DRY_RUN` - Enable dry-run mode (default: "true")
 - `DEBUG` - Enable debug output (default: "false")

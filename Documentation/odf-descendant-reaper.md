@@ -222,7 +222,7 @@ python3 utils/odf-descendant-reaper.py
 
 **Optional:**
 - `MAX_CHAIN_DEPTH` - depth cap before forcing `NEEDS_REVIEW` (default: 10)
-- `CL_RBD_NAMESPACE` - RBD namespace within the pool (Ceph multi-tenancy, distinct from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace). Used by `odf-oc-compare.py`'s generated cleanup script for GUIDs it found living in a named namespace - `odf-cleanup.py` can't reach those (it only ever operates in the default namespace), so they're routed here instead. Can also be set **alone** (no `CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST`) to just remove an already-empty named namespace
+- `CL_RBD_NAMESPACE` - RBD namespace within the pool (Ceph multi-tenancy, distinct from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace). `odf-cleanup.py` supports this too now for GUID cleanup - the generated script uses it there, and reserves this tool for removing the namespace itself once empty, for `CL_CLEANUP_LIST` (parentless CSI leftovers have no GUID), and as the manual fallback when `odf-cleanup.py` fails. Can also be set **alone** (no `CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST`) to just remove an already-empty named namespace
 - `DEBUG` - verbose diagnostics, e.g. filtered-watcher details
 
 Orphaned clone repair (see "Orphaned Clone Repair" below) has no separate toggle - diagnosis always runs when the trash-safe fallback hits an unresolvable snapshot, and the actual repair follows the same `DRY_RUN` convention as everything else in execute mode.

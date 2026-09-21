@@ -178,6 +178,7 @@ class OdfCleaner:
         self.ioctx = None
         self.lab_guid = None
         self.pool_name = None
+        self.rbd_namespace = None
         self.my_instance_id = None
         self.tree = OdfTree()
         self.removal_stats = {
@@ -219,6 +220,9 @@ class OdfCleaner:
             self.cluster = rados.Rados(conffile=conf_file, conf=dict(keyring=keyring), name=client_name)
             self.cluster.connect()
             self.ioctx = self.cluster.open_ioctx(self.pool_name)
+            self.rbd_namespace = os.environ.get('CL_RBD_NAMESPACE', '')
+            if self.rbd_namespace:
+                self.ioctx.set_namespace(self.rbd_namespace)
             # Needed to filter our own watch out of watcher checks - opening
             # an image to inspect it registers a watch too.
             self.my_instance_id = self.cluster.get_instance_id()
@@ -1196,6 +1200,39 @@ class OdfCleaner:
             print(f"  ERROR: Could not perform final verification: {e}")
             print("  Continuing with cleanup report...")
     
+    def _remove_namespace_if_empty(self):
+        """If CL_RBD_NAMESPACE was set, remove it once confirmed empty of images/trash.
+        Best-effort, never affects overall cleanup success."""
+        ns = self.rbd_namespace
+        if not ns:
+            return
+        try:
+            remaining_images = list(rbd.RBD().list(self.ioctx))
+            remaining_trash = list(rbd.RBD().trash_list(self.ioctx))
+        except Exception as e:
+            print(f"[x] Could not check whether RBD namespace '{ns}' is empty: {e}")
+            return
+
+        if remaining_images or remaining_trash:
+            print(f"  RBD namespace '{ns}' still has {len(remaining_images)} image(s)/"
+                  f"{len(remaining_trash)} trash item(s) - leaving it in place")
+            return
+
+        if self.dry_run:
+            print(f"  RBD namespace '{ns}' is now empty - would remove it "
+                  f"(rbd namespace rm {self.pool_name}/{ns})")
+            return
+
+        # namespace_remove operates at the pool level, not inside the
+        # namespace itself - the ioctx needs to be back in the default
+        # namespace for the call to find it.
+        self.ioctx.set_namespace('')
+        try:
+            rbd.RBD().namespace_remove(self.ioctx, ns)
+            print(f"  [v] Removed empty RBD namespace: {ns}")
+        except Exception as e:
+            print(f"  [x] Failed to remove RBD namespace '{ns}': {e}")
+
     def cleanup(self):
         """Main cleanup orchestration"""
         if not self.connect():
@@ -1213,6 +1250,7 @@ class OdfCleaner:
                         print(f"  - {err}")
                     return False
                 print("No items found for cleanup")
+                self._remove_namespace_if_empty()
                 return True
             
             # Tree building phase
@@ -1234,6 +1272,7 @@ class OdfCleaner:
                 print(f"ERROR: Cleanup failed for {failed_count} items")
                 return False
             
+            self._remove_namespace_if_empty()
             return True
             
         except Exception as e:
@@ -1261,6 +1300,8 @@ def main():
         print("\nOptional environment variables:")
         print("  DRY_RUN=[true/false]     - Enable dry-run mode (default: true)")
         print("  DEBUG=[true/false]       - Enable debug output (default: false)")
+        print("  CL_RBD_NAMESPACE         - RBD namespace within the pool (Ceph multi-tenancy, distinct")
+        print("    from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace)")
         return 1
     
     # Check for dry run mode
@@ -1272,6 +1313,9 @@ def main():
     print(f"  Pool: {os.environ['CL_POOL']}")
     print(f"  Dry Run: {'YES' if dry_run else 'NO'}")
     print(f"  Debug: {os.environ.get('DEBUG', 'false').upper()}")
+    rbd_namespace = os.environ.get('CL_RBD_NAMESPACE', '')
+    if rbd_namespace:
+        print(f"  RBD Namespace: {rbd_namespace}")
     
     if not dry_run:
         print(f"\nWARNING: LIVE MODE ENABLED - ACTUAL DELETION WILL OCCUR!")
