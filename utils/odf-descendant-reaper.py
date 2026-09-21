@@ -19,7 +19,9 @@ Usage:
                                          # ls when found - see Documentation/odf-descendant-reaper.md
     export CL_RBD_NAMESPACE="ns-name"   # optional: RBD namespace within the pool (Ceph multi-tenancy,
                                          # distinct from k8s namespaces) some provisioners use instead
-                                         # of the pool's default namespace
+                                         # of the pool's default namespace. Can also be set ALONE (no
+                                         # CL_LAB/CL_VOLUME/CL_CLEANUP_LIST) to just remove an already-
+                                         # empty named namespace
     python3 utils/odf-descendant-reaper.py
 
 Author:  gh:@yordangit
@@ -145,18 +147,16 @@ class DescendantReaper:
 
     def _length_prefixed(self, s: str) -> bytes:
         """Encode a string the way rbd_directory/rbd_id.<name> values are
-        stored: 4-byte LE length + raw bytes. Confirmed byte-for-byte against
-        real cluster output - see Documentation/odf-descendant-reaper.md."""
+        stored: 4-byte LE length + raw bytes."""
         b = s.encode()
         return struct.pack('<I', len(b)) + b
 
     def _check_phantom_entry(self, image_name: str) -> Optional[str]:
         """Detects two known corruption patterns where an image can't be
-        opened despite still existing in some form (see Documentation/
-        odf-descendant-reaper.md): 'phantom' (rbd_id.<name> exists, points to
-        an id whose rbd_header is missing
+        opened despite still existing in some form: 'phantom' (rbd_id.<name> exists,
+        points to an id whose rbd_header is missing)
         and 'missing_rbdid' (rbd_id.<name> itself is gone, but rbd_directory
-        still resolves a name->id mapping whose rbd_header genuinely exists -
+        still resolves a name->id mapping whose rbd_header genuinely exists,
         just the pointer object needs recreating). Sets self._phantom_pattern
         for _format_phantom_message()/_execute_phantom_cleanup() to use."""
         self._phantom_pattern = None
@@ -184,14 +184,14 @@ class DescendantReaper:
             return image_id
 
     def _check_missing_rbdid(self, image_name: str) -> Optional[str]:
-        """The inverse of a phantom entry: rbd_id.<name> is gone, but
+        """Inverse phantom entry: rbd_id.<name> is gone, but
         rbd_directory's name_<name> omap key still resolves to an id whose
-        rbd_header genuinely exists - a real, valid image just missing its
+        rbd_header genuinely exists: a real, valid image just missing its
         convenience name->id pointer. Safer/simpler to repair than an
         orphaned clone since two independent sources already agree on the id."""
         raw = self._get_omap_value("rbd_directory", f"name_{image_name}")
         if raw is None:
-            return None  # genuinely gone, not a known pattern
+            return None  # genuinely gone
         try:
             length = struct.unpack_from('<I', raw, 0)[0]
             image_id = raw[4:4 + length].decode('utf-8', errors='replace')
@@ -223,8 +223,8 @@ class DescendantReaper:
     def _execute_phantom_cleanup(self, image_name: str, image_id: str) -> bool:
         """Actually applies whichever pattern _check_phantom_entry() last
         confirmed: recreates the missing rbd_id pointer ('missing_rbdid'), or
-        removes the dangling rbd_id + rbd_directory entries ('phantom') -
-        never touches rbd_header/data objects either way."""
+        removes the dangling rbd_id + rbd_directory entries ('phantom'),
+        never touches rbd_header/data objects."""
         if self._phantom_pattern == 'missing_rbdid':
             try:
                 self.ioctx.write_full(f"rbd_id.{image_name}", self._length_prefixed(image_id))
@@ -249,8 +249,7 @@ class DescendantReaper:
 
     def _get_omap_value(self, obj: str, key: str) -> Optional[bytes]:
         """Read one raw omap value. Tries the read_op binding first, falls
-        back to the rados CLI (the only path actually validated live against
-        this cluster - see Documentation/odf-descendant-reaper.md)."""
+        back to the rados CLI"""
         try:
             read_op = self.ioctx.create_read_op()
             it, _ = self.ioctx.get_omap_vals_by_keys(read_op, (key,))
@@ -274,10 +273,7 @@ class DescendantReaper:
     def _decode_child_image_specs(self, raw: bytes) -> List[Dict]:
         """Decode a snap_children_<snapid> omap value: a set of
         {pool_id, image_id, pool_namespace} entries RBD's clone-v2 tracking
-        keeps on the PARENT's own header, independent of list_children2().
-        Byte layout reverse-engineered from real cluster output (not from
-        Ceph source) - see Documentation/odf-descendant-reaper.md. Re-verify
-        if this ever stops matching."""
+        keeps on the PARENT's own header, independent of list_children2()."""
         specs = []
         try:
             count = struct.unpack_from('<I', raw, 0)[0]
@@ -305,13 +301,11 @@ class DescendantReaper:
 
     def _diagnose_and_repair_orphan(self, image_name: str, snap_id: int, execute: bool) -> bool:
         """When list_children2() fails on a trashed snapshot, this reads the
-        clone-v2 child pointer straight off the parent's header omap -
-        bypassing list_children2()/list_descendants() entirely - to find a
+        clone-v2 child pointer straight off the parent's header omap,
+        bypassing list_children2()/list_descendants() entirely, to find a
         real child image that exists (valid header/data) but is invisible to
-        every listing API and to `rbd ls`/`rbd trash ls`. Only actually
-        removes anything if execute=True. Full manual procedure this
-        automates: Documentation/odf-descendant-reaper.md. Returns True if a
-        repair was made (worth retrying the caller's list_children2())."""
+        API listings and to: `rbd ls` and `rbd trash ls`.
+        Returns True if a repair was made (worth retrying the caller's list_children2())."""
         try:
             with rbd.Image(self.ioctx, image_name) as img:
                 parent_id = img.id()
@@ -346,10 +340,8 @@ class DescendantReaper:
         """Confirm orphan_id matches the known pattern (header exists, no
         rbd_directory entry, not sitting in rbd trash, itself childless and
         snapshot-free) and, if so, temporarily relink it into rbd_directory,
-        remove it via the normal API (which correctly detaches it from its
-        parent), then drop the temporary link. Rolls back on any unexpected
-        state rather than guessing. See Documentation/odf-descendant-
-        reaper.md for the full manual procedure this automates."""
+        remove it via the normal API (which detaches it from its parent),
+        then drop the temporary link. Rolls back on any unexpected state."""
         name = f"orphan-recovery-{orphan_id}"
 
         if self._get_omap_value("rbd_directory", f"id_{orphan_id}") is not None:
@@ -517,8 +509,6 @@ class DescendantReaper:
                 # NOTE: on Ceph 18.2.8 (reef)/python3-rbd, create_timestamp()
                 # has consistently come back exactly 5h ahead of access_
                 # timestamp()/modify_timestamp().
-                # Unconfirmed whether this is specific to this Ceph/client
-                # version, no correction applied.
                 node.create_timestamp = self._get_timestamp(img, 'create_timestamp')
                 node.access_timestamp = self._get_timestamp(img, 'access_timestamp')
                 node.modify_timestamp = self._get_timestamp(img, 'modify_timestamp')
@@ -529,8 +519,8 @@ class DescendantReaper:
                             'name': s.get('name'), 'id': s.get('id'),
                             'protected': self._is_protected_snap(img, s.get('name')),
                             # RBD "clone v2" moves a deleted snapshot with live clones into
-                            # a trash namespace instead of blocking the delete - it's then
-                            # only reachable by id, not by name (confirmed against real
+                            # a trash namespace instead of blocking the delete: it's then
+                            # only reachable by id, not by name (confirmed against
                             # cluster output: even `rbd snap rm --force` can't find it by name).
                             'is_trash': 'trash' in s,
                         }
@@ -579,11 +569,9 @@ class DescendantReaper:
 
     def _direct_children_trash_safe(self, img, image_name: str, execute: bool = False) -> (List[Dict], bool):
         """One level of children via set_snap()/set_snap_by_id() per snapshot +
-        list_children2() - works even when a snapshot is in RBD's trash
-        namespace, which makes list_descendants() fail outright (confirmed
-        against real cluster output: a trashed snap can still have a live
-        child, which is exactly why it's still sitting there). Returns
-        (children, ok) - ok=False means at least one snapshot's children
+        list_children2(), works even when a snapshot is in RBD's trash
+        namespace, which makes list_descendants() fail outright. Returns
+        (children, ok). ok=False -> at least one snapshot's children
         couldn't be listed (confirmed this can happen even via set_snap_by_id)
         - that's "unknown", never treat it as "confirmed no children"."""
         children = []
@@ -627,7 +615,7 @@ class DescendantReaper:
     def _walk_descendants_trash_safe(self, root_name: str, execute: bool = False) -> (List[Dict], bool):
         """Recursive fallback for list_descendants() - only used when it fails
         outright. list_children2() is single-level, so this does its own BFS.
-        Returns (children, ok) - ok=False if any node's children couldn't be
+        Returns (children, ok). ok=False -> if any node's children couldn't be
         fully resolved (must not be reported as a clean/empty result)."""
         all_children = []
         seen = set()
@@ -786,18 +774,44 @@ class DescendantReaper:
                 return False
         return True
 
-    def analyze_guid(self, guid: Optional[str], volume_name: Optional[str], execute: bool = False) -> str:
-        """Main analysis entry point: either a specific volume, or all volumes
-        for a GUID. Returns a status string: NO_VOLUMES_FOUND / ERROR / CLEAN /
-        ALL_SAFE / NEEDS_REVIEW / RESOLVED. ERROR means we couldn't even read a
-        volume's descendants - never conflate that with "genuinely has none".
-        RESOLVED (execute=True only) means everything blocking was actually
-        removed and it's now safe to retry the volume's normal cleanup.
+    def _remove_volume_directly(self, name: str) -> bool:
+        """Fresh watcher + snapshot-aware removal of a volume with no live
+        descendants left (either it never had any, or its chains were just
+        removed above). Re-check watchers now rather than trusting 
+        rbd.RBD().remove() to block on them (it doesn't)."""
+        try:
+            with rbd.Image(self.ioctx, name) as img:
+                watchers = self._get_watchers(img, name)
+                if watchers:
+                    print(f"  [x] SKIPPED removing {name}: active watcher(s) {watchers}")
+                    return False
+                snaps = [
+                    {'name': s.get('name'), 'id': s.get('id'),
+                     'protected': self._is_protected_snap(img, s.get('name')),
+                     'is_trash': 'trash' in s}
+                    for s in img.list_snaps() if s.get('name')
+                ]
+                for snap in snaps:
+                    if snap['is_trash']:
+                        img.remove_snap_by_id(snap['id'])
+                        continue
+                    if snap['protected'] is not False:
+                        try:
+                            img.unprotect_snap(snap['name'])
+                        except Exception:
+                            pass
+                    img.remove_snap(snap['name'])
+            rbd.RBD().remove(self.ioctx, name)
+            print(f"  [v] Removed volume itself: {name}")
+            return True
+        except Exception as e:
+            print(f"  [x] Failed to remove volume {name}: {e}")
+            return False
 
-        execute=True actually deletes: chains classified SAFE_TO_REMOVE, and
-        confirmed phantom entries (dangling pointer, no data, cause is known).
-        Everything else (active watchers, undiagnosed errors, truncated
-        chains) is never touched - cause not determined, needs a human."""
+    def analyze_guid(self, guid: Optional[str], volume_name: Optional[str], execute: bool = False) -> str:
+        """Entry point for a GUID or a specific volume. Returns one of:
+        NO_VOLUMES_FOUND / ERROR / CLEAN / ALL_SAFE / NEEDS_REVIEW / RESOLVED
+        execute=True removes SAFE_TO_REMOVE chains"""
         if volume_name:
             volumes = [volume_name]
         else:
@@ -829,11 +843,11 @@ class DescendantReaper:
                         print(f"  [x] Phantom cleanup failed - {vol} still needs review")
                 continue
 
-            if not chains:
-                print("  [v] No active descendants - clean orphan, nothing to review")
-                continue
+            if chains:
+                any_chains = True
+            else:
+                print("  [v] No active descendants - clean orphan")
 
-            any_chains = True
             all_safe = True
             for chain_root in chains:
                 classification = self.classify(chain_root)
@@ -853,22 +867,19 @@ class DescendantReaper:
                     print(f"  [x] Classification: NEEDS_REVIEW - {reason}")
 
             # Only offer/attempt the volume's own removal once all its
-            # descendant chains are safe (odf-cleanup.py would still block it
-            # otherwise).
+            # descendant chains are safe
             if all_safe:
                 if execute:
-                    try:
-                        rbd.RBD().remove(self.ioctx, vol)
-                        print(f"  [v] Removed volume itself: {vol}")
-                    except Exception as e:
+                    if not self._remove_volume_directly(vol):
                         all_safe = False
-                        print(f"  [x] Failed to remove volume {vol}: {e}")
                 else:
-                    print(f"\n  All descendant chains are SAFE_TO_REMOVE.")
-                    print("  Manual removal order (descendants first, volume last):")
-                    for chain_root in chains:
-                        self.print_removal_order(chain_root)
-                    print(f"    rbd rm {self.pool_name}/{vol}   # the volume itself, now that its descendants are gone")
+                    if chains:
+                        print(f"\n  All descendant chains are SAFE_TO_REMOVE.")
+                        print("  Manual removal order (descendants first, volume last):")
+                        for chain_root in chains:
+                            self.print_removal_order(chain_root)
+                    print(f"    rbd rm {self.pool_name}/{vol}   # the volume itself" +
+                          (", now that its descendants are gone" if chains else " (clean orphan)"))
 
             if not all_safe:
                 every_volume_all_safe = False
@@ -876,27 +887,24 @@ class DescendantReaper:
                       f"resolve the NEEDS_REVIEW chain(s) above first")
 
         print("\n" + "=" * 80)
-        if not any_chains and not any_error:
+        if not any_chains and not any_error and not execute:
             print("SUMMARY: no descendant chains found - safe to proceed with normal cleanup")
         print("=" * 80)
 
         if any_error:
             return 'ERROR'
-        if not any_chains:
-            return 'CLEAN'
+        if not any_chains and not execute:
+            return 'CLEAN'  # dry-run, nothing blocking - defer to a normal cleanup run
         if every_volume_all_safe:
             return 'RESOLVED' if execute else 'ALL_SAFE'
         return 'NEEDS_REVIEW'
 
 
     def cleanup_named_images(self, names: List[str], execute: bool) -> bool:
-        """Remove specific images already vetted as safe by an external caller
-        (e.g. odf-oc-compare.py's k8s-verified SAFE TO DELETE list for
-        parentless csi-snap/csi-vol images) - not routed through classify()/
-        chain-walking, which has no k8s awareness of its own. Still does one
-        fresh watcher + children check per image here, since cluster state
-        can change between analysis and execution. Returns False if any
-        removal actually failed (skips are not failures)."""
+        """For each name: check watchers + children fresh, skip if either is
+        non-empty or it won't open, else remove its snapshots then itself
+        (or just print what would happen, if not execute). Returns False if
+        any removal actually failed (skips don't count as failures)."""
         removed = skipped = failed = 0
         for name in names:
             print(f"\n{name}:")
@@ -972,6 +980,41 @@ class DescendantReaper:
         print("=" * 80)
         return failed == 0
 
+    def remove_namespace_if_empty(self, ns: str, execute: bool) -> bool:
+        """Lists images/trash in ns; if non-empty skip, otherwise removes it.
+        Returns True only if ns confirmed empty."""
+        if not ns:
+            return True  # default namespace - nothing to do, not a failure
+        try:
+            remaining_images = list(rbd.RBD().list(self.ioctx))
+            remaining_trash = list(rbd.RBD().trash_list(self.ioctx))
+        except Exception as e:
+            print(f"\n[x] Could not check whether RBD namespace '{ns}' is empty: {e}")
+            return False
+
+        if remaining_images or remaining_trash:
+            print(f"\n  RBD namespace '{ns}' still has {len(remaining_images)} image(s)/"
+                  f"{len(remaining_trash)} trash item(s) - leaving it in place")
+            return False
+
+        if not execute:
+            print(f"\n  RBD namespace '{ns}' is now empty - would remove it "
+                  f"(rbd namespace rm {self.pool_name}/{ns})")
+            return True
+
+        # namespace_remove operates at the pool level, not inside the
+        # namespace itself - the ioctx needs to be back in the default
+        # namespace for the call to find it.
+        self.ioctx.set_namespace('')
+        try:
+            rbd.RBD().namespace_remove(self.ioctx, ns)
+            print(f"\n  [v] Removed empty RBD namespace: {ns}")
+            return True
+        except Exception as e:
+            print(f"\n  [x] Failed to remove RBD namespace '{ns}': {e}")
+            self.ioctx.set_namespace(ns)  # ns still exists - restore scope
+            return False
+
 
 def main():
     """Main entry point"""
@@ -992,6 +1035,7 @@ def main():
         print("  CL_LAB          - GUID whose volumes should be inspected")
         print("  CL_VOLUME       - a specific image name to inspect directly")
         print("  CL_CLEANUP_LIST - file of pre-vetted image names (one per line) to remove directly")
+        print("  CL_RBD_NAMESPACE alone - just remove an already-empty named RBD namespace, nothing else to clean")
         print("\nOptional:")
         print("  MAX_CHAIN_DEPTH=N  - depth cap before forcing NEEDS_REVIEW (default: 10)")
         print("  DRY_RUN=[true/false]  - false actually deletes SAFE_TO_REMOVE chains + phantom entries,")
@@ -1004,22 +1048,26 @@ def main():
     guid = os.environ.get('CL_LAB')
     volume_name = os.environ.get('CL_VOLUME')
     cleanup_list_file = os.environ.get('CL_CLEANUP_LIST')
+    rbd_namespace = os.environ.get('CL_RBD_NAMESPACE', '')
 
-    if not guid and not volume_name and not cleanup_list_file:
-        print("[x] Error: Set one of CL_LAB (GUID), CL_VOLUME (image name), or CL_CLEANUP_LIST (file of image names)")
+    if not guid and not volume_name and not cleanup_list_file and not rbd_namespace:
+        print("[x] Error: Set one of CL_LAB (GUID), CL_VOLUME (image name), CL_CLEANUP_LIST (file of image names), "
+              "or CL_RBD_NAMESPACE alone to just remove an already-empty RBD namespace")
         return 1
 
     debug = os.environ.get('DEBUG', 'false').lower() in ['true', '1', 'yes']
 
     if cleanup_list_file:
         target_desc = f"image list from {cleanup_list_file}"
-    else:
+    elif guid or volume_name:
         target_desc = 'GUID ' + guid if guid else 'Volume ' + volume_name
+    else:
+        target_desc = f"(none - just checking/removing empty RBD namespace '{rbd_namespace}')"
 
     print("Configuration:")
     print(f"  Pool: {os.environ['CL_POOL']}")
-    if os.environ.get('CL_RBD_NAMESPACE'):
-        print(f"  RBD Namespace: {os.environ['CL_RBD_NAMESPACE']}")
+    if rbd_namespace:
+        print(f"  RBD Namespace: {rbd_namespace}")
     print(f"  Target: {target_desc}")
     print(f"  Max chain depth: {MAX_CHAIN_DEPTH}")
     print(f"  Dry Run: {'YES' if dry_run else 'NO'}")
@@ -1048,14 +1096,24 @@ def main():
             if not names:
                 print("[v] Cleanup list is empty - nothing to do")
                 return 0
-            return 0 if reaper.cleanup_named_images(names, execute=execute) else 1
+            ok = reaper.cleanup_named_images(names, execute=execute)
+            reaper.remove_namespace_if_empty(rbd_namespace, execute=execute)
+            return 0 if ok else 1
 
-        status = reaper.analyze_guid(guid, volume_name, execute=execute)
-        # Exit 0 only when there's nothing left blocking normal cleanup;
-        # non-zero tells a caller (e.g. a wrapper script) this GUID still
-        # needs a human, so it doesn't get silently treated as done.
-        resolved_statuses = ('NO_VOLUMES_FOUND', 'CLEAN', 'RESOLVED')
-        return 0 if status in resolved_statuses else 1
+        if guid or volume_name:
+            status = reaper.analyze_guid(guid, volume_name, execute=execute)
+            reaper.remove_namespace_if_empty(rbd_namespace, execute=execute)
+            # Exit 0 only when there's nothing left blocking normal cleanup;
+            # non-zero tells a caller (e.g. a wrapper script) this GUID still
+            # needs a human, so it doesn't get silently treated as done.
+            resolved_statuses = ('NO_VOLUMES_FOUND', 'CLEAN', 'RESOLVED')
+            return 0 if status in resolved_statuses else 1
+
+        # CL_RBD_NAMESPACE set alone, nothing to clean - just remove the
+        # namespace itself if it's already empty (e.g. odf-oc-compare.py
+        # found it empty from the start, no orphaned GUID to route here).
+        print(f"\nNo CL_LAB/CL_VOLUME/CL_CLEANUP_LIST set - just checking RBD namespace '{rbd_namespace}'")
+        return 0 if reaper.remove_namespace_if_empty(rbd_namespace, execute=execute) else 1
     except Exception as e:
         print(f"[x] Error during analysis: {e}")
         return 1

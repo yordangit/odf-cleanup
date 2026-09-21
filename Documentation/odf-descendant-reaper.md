@@ -1,7 +1,7 @@
 # ODF Descendant Reaper Script Documentation
 
 ## Overview
-The `odf-descendant-reaper.py` script discovers and classifies stranded RBD descendant chains that block `odf-cleanup.py`'s "still has active descendants" check. It rebuilds the true parent/child tree for a volume, classifies each chain, and - in execute mode - removes what's provably safe.
+The `odf-descendant-reaper.py` script discovers and classifies stranded RBD descendant chains that block `odf-cleanup.py`'s "still has active descendants" check. It rebuilds the true parent/child tree for a volume, classifies each chain, and - in execute mode - removes what's provably safe (including the volume itself, and the RBD namespace it lived in, once nothing's left).
 
 ## Assumptions
 - `odf-cleanup.py` refuses to delete a volume if `list_descendants()` returns anything active
@@ -25,7 +25,7 @@ graph TD
     E -->|"No"| F["Check for Phantom Entry"]
     F --> G["Report ERROR (or clean up phantom if execute)"]
     E -->|"Yes"| H{"Any Descendants?"}
-    H -->|"No"| I["Report CLEAN"]
+    H -->|"No"| I["_remove_volume_directly() if execute, else Report CLEAN"]
     H -->|"Yes"| J["Rebuild Parent/Child Tree"]
     J --> K["classify() Each Chain"]
     K --> L{"SAFE_TO_REMOVE?"}
@@ -137,6 +137,10 @@ graph TD
 **When:** `execute=True` and a chain is `SAFE_TO_REMOVE`
 **Does:** Leaf-first: unprotects + removes every snapshot (trashed ones via `remove_snap_by_id()`, others via `remove_snap()`), then removes each image, directly via the RBD Python bindings - stops at the first failure rather than partially completing and reporting success
 
+#### `_remove_volume_directly()`
+**When:** `execute=True` and a volume has no descendant chains left to remove - either it never had any (the common "clean orphan" case) or `_execute_chain_removal()` just cleared them all
+**Does:** Fresh `_get_watchers()` check first (state can change between analysis and this call, and `rbd.RBD().remove()` itself does **not** block on watchers), then removes/unprotects the volume's own snapshots (same trash/protected handling as `_execute_chain_removal()`) before removing the volume itself. Returns `False` on a watcher or any failure - never silently skipped as if nothing needed doing
+
 #### `_execute_phantom_cleanup()`
 **When:** `execute=True` and `_check_phantom_entry()` confirmed a pattern
 **Does:** Applies whichever pattern was detected - for `'phantom'`, removes the dangling `rbd_id` object and its two `rbd_directory` omap keys; for `'missing_rbdid'`, recreates the single missing `rbd_id.<name>` object. Never touches `rbd_header` or any data object either way
@@ -147,8 +151,8 @@ graph TD
 **Purpose:** Entry point for a GUID or a specific volume
 **Does:**
 - Resolves target volume(s), analyzes each, prints/executes as appropriate
-- Only offers/attempts removal of the volume itself once **all** its descendant chains are safe (matches what would actually let `odf-cleanup.py` succeed)
-- Returns one of: `NO_VOLUMES_FOUND`, `ERROR`, `CLEAN`, `ALL_SAFE`, `NEEDS_REVIEW`, `RESOLVED` (execute-only)
+- Only offers/attempts removal of the volume itself once **all** its descendant chains are safe (matches what would actually let `odf-cleanup.py` succeed) - trivially true when there were zero chains to begin with, so a clean orphan is removed directly via `_remove_volume_directly()` in execute mode rather than just being reported and skipped (nothing else deletes it for GUIDs living in a named RBD namespace, since `odf-cleanup.py` can't reach those)
+- Returns one of: `NO_VOLUMES_FOUND`, `ERROR`, `CLEAN` (dry-run only), `ALL_SAFE`, `NEEDS_REVIEW`, `RESOLVED` (execute-only, covers both "chains removed" and "clean orphan removed directly")
 
 ### Direct Removal Mode
 
@@ -161,6 +165,18 @@ graph TD
 - Anything with a watcher, children, or an unresolved open error is skipped (not a failure) - only actual removal errors count as `failed`
 - Returns `False` only if a removal genuinely failed
 
+### Namespace Cleanup
+
+#### `remove_namespace_if_empty()`
+**When:** After every mode above finishes (`CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST`), and as the sole action when `CL_RBD_NAMESPACE` is set with none of those
+**Purpose:** A named RBD namespace whose images are all gone is dead weight left behind for no reason - removes it too, so nothing needs a separate manual sweep later
+**Does:**
+- No-op (`True`) if `CL_RBD_NAMESPACE` wasn't set - nothing to do, not a failure
+- Lists images + trash in the namespace (ioctx is already scoped there from `connect()`); if either is non-empty, leaves it alone and returns `False`
+- If empty and `execute=False`, prints what it would run and returns `True`
+- If empty and `execute=True`, resets the ioctx to the default namespace (`namespace_remove()` operates at the pool level, not from inside the namespace being removed) and removes it - scope is only restored to `ns` if the removal itself failed, since a successfully-removed namespace no longer exists to scope back to
+- Returns `False` on any failure (couldn't list, or removal itself failed)
+
 ---
 
 ## Main Entry Point
@@ -168,10 +184,12 @@ graph TD
 ### `main()`
 **Does:**
 - Derives `execute` from `DRY_RUN` (default `"true"` - discovery-only), same convention as `odf-cleanup.py`
-- Validates required env vars (`CL_POOL`, `CL_CONF`, `CL_KEYRING`) and that one of `CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST` is set
+- Validates required env vars (`CL_POOL`, `CL_CONF`, `CL_KEYRING`) and that one of `CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST`/`CL_RBD_NAMESPACE` (alone) is set
 - `CL_CLEANUP_LIST` takes precedence and dispatches to `cleanup_named_images()` instead of `analyze_guid()`
+- If none of `CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST` are set but `CL_RBD_NAMESPACE` is, there's nothing to analyze - just calls `remove_namespace_if_empty()` directly (namespace-only mode, used by `odf-oc-compare.py` for namespaces it found empty from the start)
+- After `analyze_guid()` or `cleanup_named_images()` completes, calls `remove_namespace_if_empty()` for whatever `CL_RBD_NAMESPACE` was set (no-op if unset) - best-effort, doesn't affect the exit code from those two paths since the volume-level result already stands on its own
 - Prints a live-mode warning banner when `DRY_RUN=false`
-- Exit code: `0` only for `NO_VOLUMES_FOUND` / `CLEAN` / `RESOLVED` (or `cleanup_named_images()` returning `True`) - anything else is non-zero, so a calling script knows this still needs attention
+- Exit code: `0` only for `NO_VOLUMES_FOUND` / `CLEAN` / `RESOLVED` (or `cleanup_named_images()`/namespace-only mode returning `True`) - anything else is non-zero, so a calling script knows this still needs attention
 
 ---
 
@@ -204,7 +222,7 @@ python3 utils/odf-descendant-reaper.py
 
 **Optional:**
 - `MAX_CHAIN_DEPTH` - depth cap before forcing `NEEDS_REVIEW` (default: 10)
-- `CL_RBD_NAMESPACE` - RBD namespace within the pool (Ceph multi-tenancy, distinct from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace). Used by `odf-oc-compare.py`'s generated cleanup script for GUIDs it found living in a named namespace - `odf-cleanup.py` can't reach those (it only ever operates in the default namespace), so they're routed here instead
+- `CL_RBD_NAMESPACE` - RBD namespace within the pool (Ceph multi-tenancy, distinct from k8s namespaces) some provisioners isolate a lab's images into (default: pool's default namespace). Used by `odf-oc-compare.py`'s generated cleanup script for GUIDs it found living in a named namespace - `odf-cleanup.py` can't reach those (it only ever operates in the default namespace), so they're routed here instead. Can also be set **alone** (no `CL_LAB`/`CL_VOLUME`/`CL_CLEANUP_LIST`) to just remove an already-empty named namespace
 - `DEBUG` - verbose diagnostics, e.g. filtered-watcher details
 
 Orphaned clone repair (see "Orphaned Clone Repair" below) has no separate toggle - diagnosis always runs when the trash-safe fallback hits an unresolvable snapshot, and the actual repair follows the same `DRY_RUN` convention as everything else in execute mode.
@@ -248,10 +266,10 @@ Classification is deliberately conservative - false negatives (flagging somethin
 
 #### Strategy:
 - Everything else a chain could be classified as (`NEEDS_REVIEW`, undiagnosed `ERROR`) is never touched automatically, regardless of `DRY_RUN`
-- The volume itself is only removed once **all** of its descendant chains were actually removed successfully in this same run
+- The volume itself is only removed once **all** of its descendant chains were actually removed successfully in this same run - including the trivial case of zero chains to begin with (a "clean orphan"), via `_remove_volume_directly()`
 
 #### **Key Point:**
-Execute mode only ever acts on causes it has fully diagnosed - anything it can't explain is left for manual review rather than guessed at.
+Execute mode only ever acts on causes it has fully diagnosed - anything it can't explain is left for manual review rather than guessed at. A clean orphan (no descendants at all) is the most-diagnosed case there is, so it's removed directly rather than just reported - this matters for GUIDs living in a named RBD namespace, where the reaper *is* the whole cleanup path (`odf-cleanup.py` can't reach them), not a diagnostic step before a separate tool finishes the job.
 
 ### Direct Removal Mode Decision
 
@@ -294,3 +312,21 @@ A third corruption class, distinct from phantom entries. `rbd_header.<id>` genui
 
 #### **Key Point:**
 Confirmed and fixed live against a real cluster (see git history / session notes for the full trace): the orphan was found, the byte format was validated against two known-good relationships before trusting the decode of the mystery one, and the repair correctly cleared an `EBUSY` that had been blocking a GUID's entire cleanup chain.
+
+### Clean Orphan / Namespace Cleanup Decision
+
+#### Background:
+For a GUID living in a named RBD namespace, `odf-oc-compare.py` routes its cleanup entirely to this reaper (`odf-cleanup.py` can't reach that namespace at all). Originally, `analyze_guid()` only ever removed the volume itself once a real descendant chain had been walked and found all-safe - a volume with **zero** descendants to begin with (the common case) was just reported as a "clean orphan" and skipped, on the assumption `odf-cleanup.py` would delete it next. That assumption doesn't hold for named-namespace GUIDs - nothing else ever runs for them, so those volumes were silently never actually deleted. The empty RBD namespace left behind afterward has the same problem: nothing was ever responsible for removing it either, active GUID or not.
+
+#### Decision Mechanisms:
+- **Zero descendants is the trivial case of "all chains safe":** a clean orphan is just a volume with an empty chain list - `all_safe` starts `True` and the loop over zero chains never flips it, so the existing "remove the volume once safe" branch already fires correctly once it's not special-cased away with an early `continue`
+- **Watcher check added, not assumed:** `rbd.RBD().remove()` doesn't block on watchers by default, so both the clean-orphan and real-chain root removal paths go through the same `_remove_volume_directly()` helper, which re-checks watchers fresh first (state can change between analysis and this call)
+- **Namespace removal is separate from GUID/volume success:** `remove_namespace_if_empty()` runs after `analyze_guid()`/`cleanup_named_images()` regardless of their outcome - it just checks emptiness itself and no-ops harmlessly if there's still content, so it can't turn a real success into a false failure or vice versa
+- **Namespace-only mode for the "always was empty" case:** `odf-oc-compare.py` also finds named namespaces with zero images/trash from the very first scan - no GUID ever existed there to route through `CL_LAB`, so `CL_RBD_NAMESPACE` was made valid to set **alone**, dispatching straight to `remove_namespace_if_empty()` with nothing else to do
+
+#### Strategy:
+- **Never delete an active lab's namespace:** an empty RBD namespace is only actually dead weight if its own embedded GUID (RBD namespace names mirror k8s namespace names) doesn't match a currently-active OCP namespace - `odf-oc-compare.py` checks this before ever flagging one (see its own Workflow Decisions), the reaper itself just trusts the caller and removes what it's told to once confirmed empty
+- **Same removal safety everywhere:** one helper (`_remove_volume_directly()`) for every "remove this volume directly" call site, so the watcher/snapshot handling can't drift between the clean-orphan case and the real-chain case
+
+#### **Key Point:**
+A "clean orphan" and an "empty namespace" are both the *good* outcome, not a stopping point - previously they were dead ends that silently left real cleanup undone.

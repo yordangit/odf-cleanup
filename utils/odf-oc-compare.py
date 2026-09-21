@@ -34,6 +34,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 CLUSTER_NAME_PREFIXES = ('ocp4-cluster', 'openshift-cluster')
 VOLUME_GUID_PATTERN = re.compile(r'(?:' + '|'.join(CLUSTER_NAME_PREFIXES) + r')-([a-z0-9]+)-[a-f0-9-]+')
 
+# Pattern to extract GUID from a k8s namespace name (sandbox-{GUID}-*) - RBD
+# namespace names mirror k8s namespace names 1:1, so this doubles as the
+# pattern for those too (see discover_odf_guids()'s empty-namespace check).
+NAMESPACE_GUID_PATTERN = re.compile(r'sandbox-([a-z0-9]+)-')
+
 
 class OdfOpenShiftComparator:
     """Main class for comparing ODF volumes with OpenShift namespaces"""
@@ -51,14 +56,15 @@ class OdfOpenShiftComparator:
         self.odf_guids: Set[str] = set()
         self.orphaned_guids: Set[str] = set()
 
-        # RBD namespaces within the pool (Ceph multi-tenancy feature, distinct
-        # from k8s namespaces) - some provisioners isolate a lab's images into
-        # their own RBD namespace instead of the pool's default (''). Always
-        # includes '' (default). odf_guid_namespace tracks which namespace
-        # each ODF-side GUID's images were actually found in.
+        # RBD namespaces within the pool
+        # Always includes '' (default). odf_guid_namespace tracks
+        # which namespace each ODF-side GUID's images were found in.
         self.rbd_namespaces: List[str] = ['']
         self.odf_guid_namespace: Dict[str, str] = {}
         self._current_rbd_namespace: str = ''
+        # Orphaned RBD namespaces, no images, no trash, no active lab GUID.
+        # Flagged separately for cleanup.
+        self.empty_rbd_namespaces: List[str] = []
 
         # VolumeSnapshotContent objects, used to check real Kubernetes ownership
         # of parentless CSI snapshots (a csi-snap can have zero RBD children and
@@ -164,17 +170,12 @@ class OdfOpenShiftComparator:
             if self.debug:
                 print(f"  Found {len(namespaces.items)} total namespaces")
             
-            # Extract GUIDs from namespace names
-            # Pattern: sandbox-{GUID}-* 
-            # Extract: {GUID}
-            namespace_pattern = re.compile(r'sandbox-([a-z0-9]+)-')
-            
             self.stats['namespaces_found'] = len(namespaces.items)
             self.all_namespace_names = {ns.metadata.name for ns in namespaces.items}
             
             for namespace in namespaces.items:
                 namespace_name = namespace.metadata.name
-                match = namespace_pattern.search(namespace_name)
+                match = NAMESPACE_GUID_PATTERN.search(namespace_name)
                 if match:
                     guid = match.group(1)
                     self.active_namespace_guids.add(guid)
@@ -247,6 +248,18 @@ class OdfOpenShiftComparator:
                 self._cached_trash_items.extend((ns, item) for item in trash_items)
                 total_images += len(all_images)
                 total_trash += len(trash_items)
+
+                # Empty doesn't mean orphaned - an active lab may just have no
+                # volume here yet. Only flag it if its own GUID isn't active.
+                if ns and not all_images and not trash_items:
+                    match = NAMESPACE_GUID_PATTERN.search(ns)
+                    ns_guid = match.group(1) if match else None
+                    if ns_guid and ns_guid in self.active_namespace_guids:
+                        if self.debug:
+                            print(f"    RBD namespace '{ns}' is empty but its GUID "
+                                  f"({ns_guid}) matches an active OCP namespace - leaving it alone")
+                    else:
+                        self.empty_rbd_namespaces.append(ns)
 
                 if self.debug:
                     label = ns if ns else '(default)'
@@ -649,9 +662,7 @@ class OdfOpenShiftComparator:
     def check_empty_labs(self):
         """For active namespace GUIDs with zero ODF footprint, check OCP for
         PVCs to confirm they're genuinely empty rather than a scan gap.
-        PVCs backed by a pool other than CL_POOL (e.g. bastion/extra-disk
-        volumes on a separate cephblockpool) are out of scope for this tool
-        and don't count as suspicious - only same-pool PVCs need REVIEW."""
+        PVCs backed by a pool other than CL_POOL are out of scope."""
         no_footprint_guids = self.active_namespace_guids - self.odf_guids
         if not no_footprint_guids:
             return
@@ -745,7 +756,7 @@ class OdfOpenShiftComparator:
                 print()
 
             if namespaced_guids:
-                print("ORPHANED GUIDS IN NAMED RBD NAMESPACES (require odf-descendant-reaper.py, not odf-cleanup.py):")
+                print("ORPHANED GUIDS IN NAMED RBD NAMESPACES:")
                 for ns, guids in namespaced_guids.items():
                     print(f"  {ns}:")
                     for guid in guids:
@@ -755,7 +766,12 @@ class OdfOpenShiftComparator:
                               f"{counts['trash']} trash)")
         else:
             print("[v] No orphaned GUIDs found - all ODF volumes have active namespaces")
-        
+
+        if self.empty_rbd_namespaces:
+            print(f"\nEMPTY RBD NAMESPACES ({len(self.empty_rbd_namespaces)}, no images/trash - dead weight, will be removed):")
+            for ns in sorted(self.empty_rbd_namespaces):
+                print(f"  {ns}")
+
         print()
         
         # Parentless CSI snapshots analysis
@@ -821,10 +837,12 @@ class OdfOpenShiftComparator:
         print(f"  Orphaned GUIDs: {self.stats['orphaned_guids']}")
         namespaced_count = sum(len(g) for g in (self._cached_namespaced_guids or {}).values())
         if namespaced_count:
-            print(f"    (of which {namespaced_count} are in named RBD namespaces - see odf-descendant-reaper.py)")
+            print(f"    (of which {namespaced_count} are in named RBD namespaces)")
         print(f"  Active Labs With No ODF Footprint: {len(self.empty_labs)}")
         print(f"  Parentless CSI Snapshots: {len(self.parentless_csi_snaps)}")
         print(f"  Parentless CSI Volumes: {len(self.parentless_csi_vols)}")
+        if self.empty_rbd_namespaces:
+            print(f"  Empty RBD Namespaces: {len(self.empty_rbd_namespaces)}")
         
         print("="*80)
     
@@ -932,10 +950,9 @@ class OdfOpenShiftComparator:
     def generate_cleanup_script(self, output_file: str = "cleanup_orphaned_guids.sh"):
         """Generate bash script for automated cleanup"""
         # Parentless csi-snap/csi-vol images verified SAFE TO DELETE (zero RBD
-        # children AND no live k8s reference) - these have no lab GUID, so
+        # children AND no live k8s reference) - these have no GUID, so
         # odf-cleanup.py can't process them. Handled separately via the reaper's
-        # CL_CLEANUP_LIST mode, which re-checks watchers/children fresh before
-        # removing each one (cluster state can change between analysis and now).
+        # CL_CLEANUP_LIST mode.
         # Grouped by RBD namespace since the reaper only targets one namespace
         # per run (CL_RBD_NAMESPACE) - most will be a single default-namespace group.
         safe_csi_leftovers_by_ns: Dict[str, List[str]] = {}
@@ -948,8 +965,8 @@ class OdfOpenShiftComparator:
         safe_csi_leftovers_by_ns = {ns: sorted(names) for ns, names in sorted(safe_csi_leftovers_by_ns.items())}
         safe_csi_leftovers_total = sum(len(names) for names in safe_csi_leftovers_by_ns.values())
 
-        if not self.orphaned_guids and not safe_csi_leftovers_total:
-            print("No orphaned GUIDs or safe CSI leftovers found - no cleanup script needed")
+        if not self.orphaned_guids and not safe_csi_leftovers_total and not self.empty_rbd_namespaces:
+            print("No orphaned GUIDs, safe CSI leftovers, or empty RBD namespaces found - no cleanup script needed")
             return
         
         print(f"\nGenerating cleanup script: {output_file}")
@@ -967,13 +984,22 @@ class OdfOpenShiftComparator:
         if namespaced_guids:
             namespaced_guids_lines.append(
                 f'echo "=== NAMESPACED ORPHANED GUIDS: {total_namespaced} GUID(s) across '
-                f'{len(namespaced_guids)} RBD namespace(s) (odf-descendant-reaper.py, not odf-cleanup.py) ==="'
+                f'{len(namespaced_guids)} RBD namespace(s) ==="'
             )
             for ns, guids in namespaced_guids.items():
                 namespaced_guids_lines.append(f'echo "--- RBD namespace: {ns} ---"')
                 for guid in guids:
                     namespaced_guids_lines.append(f'process_namespaced_guid "{guid}" "{ns}"')
         namespaced_guids_block = "\n".join(namespaced_guids_lines)
+
+        empty_namespaces_lines = []
+        if self.empty_rbd_namespaces:
+            empty_namespaces_lines.append(
+                f'echo "=== EMPTY RBD NAMESPACES: {len(self.empty_rbd_namespaces)} (no images/trash) ==="'
+            )
+            for ns in sorted(self.empty_rbd_namespaces):
+                empty_namespaces_lines.append(f'remove_empty_namespace "{ns}"')
+        empty_namespaces_block = "\n".join(empty_namespaces_lines)
 
         csi_leftovers_block = ""
         if safe_csi_leftovers_by_ns:
@@ -1094,6 +1120,29 @@ process_namespaced_guid() {{
     unset CL_RBD_NAMESPACE
 }}
 
+# A named RBD namespace found completely empty (no images/trash at all) -
+# no GUID lives here to trigger cleanup via process_namespaced_guid above,
+# so it needs its own direct call into the reaper's namespace-only mode
+# (CL_RBD_NAMESPACE set, no CL_LAB/CL_VOLUME/CL_CLEANUP_LIST).
+remove_empty_namespace() {{
+    local ns="$1"
+
+    echo "=================================================="
+    echo "Removing empty RBD namespace: $ns"
+    echo "=================================================="
+
+    unset CL_LAB CL_VOLUME CL_CLEANUP_LIST
+    export CL_RBD_NAMESPACE="$ns"
+
+    if python3 "$ODF_REAPER"; then
+        echo "[v] Removed empty RBD namespace: $ns"
+    else
+        echo "[x] Failed to remove RBD namespace: $ns - see output above"
+        echo "empty RBD namespace: $ns" >> "$NEEDS_REVIEW_FILE"
+    fi
+    unset CL_RBD_NAMESPACE
+}}
+
 # Cleanup loop - Priority 1: Volumes only (safest)
 echo "=== PRIORITY 1: Volumes only (safest) ==="
 for guid in $PRIORITY_1_GUIDS; do
@@ -1115,6 +1164,7 @@ for guid in $PRIORITY_3_GUIDS; do
     echo ""
 done
 {namespaced_guids_block}
+{empty_namespaces_block}
 {csi_leftovers_block}
 echo "Cleanup script completed!"
 if [ -f "$NEEDS_REVIEW_FILE" ]; then
@@ -1133,9 +1183,11 @@ fi
             
             print(f"[v] Cleanup script created: {output_file}")
             print(f"  Contains {len(self.orphaned_guids)} orphaned GUIDs" +
-                  (f" ({total_namespaced} via odf-descendant-reaper.py in named RBD namespaces)" if total_namespaced else ""))
+                  (f" ({total_namespaced} in named RBD namespaces)" if total_namespaced else ""))
             if safe_csi_leftovers_total:
                 print(f"  Plus {safe_csi_leftovers_total} parentless csi-snap/csi-vol leftover(s) (k8s ownership verified)")
+            if self.empty_rbd_namespaces:
+                print(f"  Plus {len(self.empty_rbd_namespaces)} empty RBD namespace(s) to remove")
             print(f"  Run with: ./{output_file}")
             print("  WARNING: DRY_RUN defaults to false - this will actually delete.")
             print("  It will prompt for confirmation before proceeding; set DRY_RUN=\"true\" in the script to preview first.")

@@ -20,7 +20,7 @@ The `odf-oc-compare.py` script compares active OpenShift namespaces with ODF RBD
 - **ODF Resource Discovery**: Analyzes volumes, CSI snapshots, and trash items
 - **Parentless CSI Snapshot Analysis**: Identifies potential boot/base images by analyzing children relationships
 - **Empty Lab Verification**: For active namespaces with zero ODF footprint, checks real OCP PVCs to confirm they're genuinely empty rather than a scanning gap
-- **RBD Namespace Awareness**: Scans every RBD namespace in the pool (Ceph multi-tenancy, distinct from k8s namespaces), not just the default one - some provisioners isolate a lab's images this way; orphans found there are routed to `odf-descendant-reaper.py` (with `CL_RBD_NAMESPACE`) instead of `odf-cleanup.py`, which can't reach them
+- **RBD Namespace Awareness**: Scans every RBD namespace in the pool (Ceph multi-tenancy, distinct from k8s namespaces), not just the default one - some provisioners isolate a lab's images this way; orphans found there are routed to `odf-descendant-reaper.py` (with `CL_RBD_NAMESPACE`) instead of `odf-cleanup.py`, which can't reach them. Namespaces found completely empty are flagged too (unless their own embedded GUID still matches an active OCP namespace) and routed to the reaper for removal
 - **Smart Ordering**: Prioritizes cleanup by complexity (volumes only → volumes+snapshots → volumes+snapshots+trash)
 - **Automated Script Generation**: Creates ready-to-run cleanup scripts
 
@@ -70,8 +70,8 @@ The `odf-descendant-reaper.py` script discovers and classifies stranded RBD desc
 - **Descendant Chain Analysis** - Rebuilds the real parent/child tree via `parent_info()`, not a flat `list_descendants()` dump
 - **Classification** - `SAFE_TO_REMOVE` (zero watchers throughout, terminal chain), `NEEDS_REVIEW` (active watchers or depth limit hit), or `ERROR` (volume couldn't be opened)
 - **Phantom Entry Detection** - Catches the case where `rbd_id.<name>` exists but its `rbd_header.<id>` is missing, and can clean up the dangling pointer
-- **Execute Mode** - `DRY_RUN=false` removes `SAFE_TO_REMOVE` chains and confirmed phantom entries (same convention as `odf-cleanup.py`)
-- **RBD Namespace Targeting** - Optional `CL_RBD_NAMESPACE` scopes the whole run to a named RBD namespace (Ceph multi-tenancy, distinct from k8s namespaces) instead of the pool's default
+- **Execute Mode** - `DRY_RUN=false` removes `SAFE_TO_REMOVE` chains, confirmed phantom entries, and the volume itself once safe (including the "clean orphan" case of zero descendants to begin with) - same convention as `odf-cleanup.py`
+- **RBD Namespace Targeting** - Optional `CL_RBD_NAMESPACE` scopes the whole run to a named RBD namespace (Ceph multi-tenancy, distinct from k8s namespaces) instead of the pool's default; removes the namespace itself once it's empty, and can be set alone to just remove an already-empty one
 
 ### Usage
 

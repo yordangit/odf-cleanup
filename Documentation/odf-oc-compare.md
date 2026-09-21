@@ -48,6 +48,7 @@ graph TD
 - `empty_labs` - Active namespace GUIDs with zero ODF footprint, checked against real OCP PVCs (see `check_empty_labs()`)
 - `rbd_namespaces` - RBD namespaces within the pool (Ceph multi-tenancy, distinct from k8s namespaces) discovered via `discover_rbd_namespaces()`; always includes `''` (the pool's default namespace)
 - `odf_guid_namespace` - Maps each ODF-side GUID to the RBD namespace its images were actually found in (`''` = default)
+- `empty_rbd_namespaces` - Named RBD namespaces found with zero images and zero trash - no GUID will ever route cleanup here, so they're tracked separately and routed straight to the reaper's namespace-only removal mode
 
 ---
 
@@ -103,6 +104,7 @@ graph TD
 **Purpose:** Discovers all lab GUIDs from ODF RBD images and snapshots, across every RBD namespace in `rbd_namespaces`
 **Does:**
 - For each RBD namespace: calls `ioctx.set_namespace(ns)`, lists all active RBD images and trash items in that namespace
+- A named namespace with zero images and zero trash is recorded in `empty_rbd_namespaces`
 - Processes each image through `_extract_guid_from_image()` (unchanged logic - image names carry the GUID the same way regardless of which RBD namespace they're in)
 - Records which namespace each GUID was found in via `_record_odf_guid()` → `odf_guid_namespace`
 - Resets the ioctx back to the default namespace when done
@@ -152,6 +154,7 @@ graph TD
 **Does:**
 - Reports default-RBD-namespace orphaned GUIDs ordered by cleanup complexity
 - Separately reports orphaned GUIDs living in a named RBD namespace, grouped by namespace
+- Reports named RBD namespaces found completely empty (`empty_rbd_namespaces`) - these are dead weight with nothing routing cleanup to them otherwise
 - Analyzes parentless CSI snapshots and volumes with recommendations
 - Provides detailed statistics summary
 - Categorizes findings for actionable insights
@@ -165,9 +168,10 @@ graph TD
 - Defaults `DRY_RUN="false"` (live) but prompts for `y/n` confirmation before running anything
 - Auto-detects `odf-cleanup.py` and `odf-descendant-reaper.py` at either `./` or `../`/`utils/` so the generated script works whether it's run from the repo root or from `utils/` - no need to copy/move files
 - Per default-namespace GUID, runs `odf-cleanup.py` (which now self-handles watcher checks and phantom entries); on failure it's logged to `needs_descendant_review.txt` for manual investigation with `odf-descendant-reaper.py` instead of being retried automatically
-- Per named-RBD-namespace GUID (from `_group_namespaced_guids()`), runs `odf-descendant-reaper.py`'s `CL_LAB` chain-walking mode instead, with `CL_RBD_NAMESPACE` set - `odf-cleanup.py` only ever operates in the pool's default namespace, so it can never reach these
+- Per named-RBD-namespace GUID (from `_group_namespaced_guids()`), runs `odf-descendant-reaper.py`'s `CL_LAB` chain-walking mode instead, with `CL_RBD_NAMESPACE` set - `odf-cleanup.py` only ever operates in the pool's default namespace, so it can never reach these (the reaper also removes the namespace itself once its volumes are gone - see its docs)
+- Per already-empty named RBD namespace (`empty_rbd_namespaces`), calls `odf-descendant-reaper.py` with only `CL_RBD_NAMESPACE` set (its namespace-only mode) to remove the namespace directly - no GUID lives there to otherwise trigger this
 - Appends a section per RBD namespace that writes every parentless csi-snap/csi-vol name marked `SAFE TO DELETE` to a file and runs `odf-descendant-reaper.py` in its `CL_CLEANUP_LIST` mode against it, with `CL_RBD_NAMESPACE` set for named-namespace groups (these have no GUID, so `odf-cleanup.py` can't touch them); omitted entirely if there are none
-- Script is generated even with zero orphaned GUIDs, as long as there's at least one safe CSI leftover to clean up
+- Script is generated even with zero orphaned GUIDs, as long as there's at least one safe CSI leftover or empty RBD namespace to clean up
 
 ---
 
@@ -335,11 +339,13 @@ RBD namespaces are a Ceph-level multi-tenancy feature *within* a single pool (di
 - **Namespace Discovery:** `discover_rbd_namespaces()` lists all RBD namespaces up front, non-fatally
 - **Namespace-Tagged Discovery:** `discover_odf_guids()` loops `set_namespace()` over every RBD namespace, reusing the exact same GUID-extraction logic per namespace (image naming convention is identical inside a named namespace - confirmed live)
 - **Routing Split:** default-namespace orphaned GUIDs keep going through `odf-cleanup.py` unchanged; named-namespace GUIDs are grouped and routed to `odf-descendant-reaper.py` (`CL_LAB` + `CL_RBD_NAMESPACE`) instead, since `odf-cleanup.py` can never reach them
+- **Namespace Itself Is Cleaned Up Too:** a named RBD namespace with zero images/trash (`empty_rbd_namespaces`) is dead weight nothing else will ever remove - routed to the reaper's namespace-only mode (`CL_RBD_NAMESPACE` alone, no target) to remove it directly; a namespace that *did* have orphaned GUIDs gets its namespace removed automatically by the reaper once those volumes are gone, no separate step needed here
 
 #### Strategy:
 - **No Changes to `odf-cleanup.py`/`_odf-cleanup.sh`:** out of scope for this lab type by design - avoids touching the character-budgeted prod script for a case it was never meant to handle
 - **Reaper Gets a Single New Env Var:** `CL_RBD_NAMESPACE`, applied once at `connect()` via `ioctx.set_namespace()` - every existing reaper mode (`CL_LAB`, `CL_VOLUME`, `CL_CLEANUP_LIST`) transparently works once the ioctx is scoped, no rewrite needed there
 - **Same Split Applies to CSI Leftovers:** `safe_csi_leftovers_by_ns` groups parentless csi-snap/csi-vol `SAFE TO DELETE` entries by their RBD namespace too, since the reaper's `CL_CLEANUP_LIST` mode also needs `CL_RBD_NAMESPACE` set correctly per group
+- **No Namespace Left Behind:** whether a namespace held an orphaned GUID, safe CSI leftovers, or nothing at all, every path through the generated script ends with that namespace's content gone and the namespace itself removed - never just "images cleaned up, empty container left behind"
 
 #### **Key Point:**
 This gap wasn't a bug in the existing GUID-matching logic - it was a scope gap in *which images the pool's ioctx could even see* in the first place. Fixing it required no new GUID-extraction heuristics (namespaced images use the exact same naming convention), just namespace-aware discovery plus routing named-namespace GUIDs to the one tool (`odf-descendant-reaper.py`) that can already reach them with a single added `set_namespace()` call.
