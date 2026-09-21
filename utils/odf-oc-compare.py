@@ -15,7 +15,7 @@ Requirements:
 - ODF cluster credentials (CL_CONF, CL_KEYRING environment variables)
 
 Author:  gh:@yordangit
-Version: 26.09.18
+Version: 26.09.21
 """
 
 import rbd
@@ -895,13 +895,23 @@ class OdfOpenShiftComparator:
         return counts
     
     def _group_namespaced_guids(self) -> Dict[str, List[str]]:
-        """Orphaned GUIDs living in a named RBD namespace, grouped by namespace"""
+        """Orphaned GUIDs living in a named RBD namespace, grouped by namespace.
+        Each namespace is provisioner-isolated to one lab, so >1 GUID per
+        namespace is flagged as an anomaly, not treated as a normal finding."""
         grouped: Dict[str, List[str]] = {}
         for guid in self.orphaned_guids:
             ns = self.odf_guid_namespace.get(guid, '')
             if ns:
                 grouped.setdefault(ns, []).append(guid)
-        return {ns: sorted(guids) for ns, guids in sorted(grouped.items())}
+        result = {ns: sorted(guids) for ns, guids in sorted(grouped.items())}
+
+        for ns, guids in result.items():
+            if len(guids) > 1:
+                print(f"[!] WARNING: RBD namespace '{ns}' has {len(guids)} orphaned GUIDs "
+                      f"({', '.join(guids)}) - expected exactly one per namespace "
+                      f"(cross-lab contamination or a GUID-extraction bug?) - investigate before running cleanup")
+
+        return result
 
     def _order_guids_by_complexity(self) -> List[tuple]:
         """Order default-RBD-namespace orphaned GUIDs by cleanup complexity
@@ -1020,7 +1030,22 @@ python3 "$ODF_REAPER"
 echo ""
 ''')
             csi_leftovers_block = "".join(blocks)
-        
+
+        extra_summary_lines = []
+        if total_namespaced:
+            extra_summary_lines.append(
+                f'echo "Namespaced Orphaned GUIDs: {total_namespaced} across {len(namespaced_guids)} RBD namespace(s)"'
+            )
+        if safe_csi_leftovers_total:
+            extra_summary_lines.append(
+                f'echo "Parentless CSI leftovers (safe to delete): {safe_csi_leftovers_total}"'
+            )
+        if self.empty_rbd_namespaces:
+            extra_summary_lines.append(
+                f'echo "Empty RBD namespaces to remove: {len(self.empty_rbd_namespaces)}"'
+            )
+        extra_summary_block = "\n".join(extra_summary_lines)
+
         script_content = f"""#!/bin/bash
 # Generated orphaned GUID cleanup script
 # Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -1062,6 +1087,7 @@ echo "Starting cleanup of orphaned lab GUIDs..."
 echo "Priority 1 (volumes only): $PRIORITY_1_GUIDS"
 echo "Priority 2 (volumes + snapshots): $PRIORITY_2_GUIDS" 
 echo "Priority 3 (volumes + snapshots + trash): $PRIORITY_3_GUIDS"
+{extra_summary_block}
 echo "DRY_RUN: $DRY_RUN"
 echo ""
 
