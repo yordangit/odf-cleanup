@@ -199,12 +199,15 @@ class OdfCleaner:
         # Errors during discovery (e.g. a transient rbd.RBD().list() failure) -
         # must never be conflated with "genuinely found nothing to clean up".
         self._discovery_errors: List[str] = []
+        # Root images' csi-snap/csi-vol parents that are outside our own
+        self._external_ancestor_candidates: Set[str] = set()
     
     def _clear_dependency_cache(self):
         """Clear cached dependency analysis"""
         self._active_to_trash_dependencies = None
         self._failed_trash_restorations = set()
         self._discovery_errors = []
+        self._external_ancestor_candidates = set()
     
     def connect(self):
         """Connect to ODF cluster"""
@@ -683,7 +686,25 @@ class OdfCleaner:
             print(f"  Root images: {[img.name for img in self.tree.root_images]}")
         
         print(f"Tree built with {len(self.tree.images)} images and {len(self.tree.root_images)} root images")
-    
+
+        self._find_external_ancestor_candidates()
+
+    def _find_external_ancestor_candidates(self):
+        """A root image cloned from a csi-snap/csi-vol outside our own GUID's
+        discovered set is a candidate to recheck after cleanup - if removing
+        our own tree leaves that ancestor with zero children, we caused that
+        transition ourselves and can prove it's now orphaned (see
+        _cleanup_orphaned_ancestors)."""
+        for root in self.tree.root_images:
+            parent = root.parent_name
+            if not parent or parent in self.tree.images:
+                continue
+            if 'csi-snap' in parent or 'csi-vol' in parent:
+                self._external_ancestor_candidates.add(parent)
+        if self._external_ancestor_candidates:
+            print(f"  Found {len(self._external_ancestor_candidates)} external ancestor(s) to "
+                  f"recheck after cleanup: {sorted(self._external_ancestor_candidates)}")
+
     def plan_removal(self) -> List[OdfImage]:
         """Plan the removal order"""
         print(f"\nPlanning removal order...")
@@ -1258,6 +1279,54 @@ class OdfCleaner:
             print(f"  ERROR: Could not perform final verification: {e}")
             print("  Continuing with cleanup report...")
     
+    def _cleanup_orphaned_ancestors(self):
+        """Recheck each external ancestor found by _find_external_ancestor_candidates.
+        If it's still parentless, has zero children, and zero watchers, this
+        run's own removal of our GUID's tree just made it provably orphaned -
+        no other GUID/lab can reference a snap with zero children, so this
+        isn't a guess. Runs after a fully-successful cleanup only."""
+        if not self._external_ancestor_candidates:
+            return
+        print(f"\nChecking {len(self._external_ancestor_candidates)} external ancestor(s) for orphaning...")
+        for name in sorted(self._external_ancestor_candidates):
+            print(f"\n  Ancestor: {name}")
+            try:
+                with rbd.Image(self.ioctx, name) as img:
+                    try:
+                        has_parent = bool(img.parent_info())
+                    except Exception:
+                        has_parent = False
+                    if has_parent:
+                        print(f"    SKIPPED: still has its own parent - not a true root")
+                        continue
+                    descendants = [d for d in img.list_descendants() if not d.get('trash', False)]
+                    if descendants:
+                        print(f"    SKIPPED: still has {len(descendants)} other descendant(s)")
+                        continue
+                    watchers = self._get_watchers(img, name)
+                    if watchers:
+                        print(f"    SKIPPED: has active watcher(s) {watchers}")
+                        continue
+
+                    if self.dry_run:
+                        print(f"    DRY RUN: would remove - orphaned by this run "
+                              f"(lost last child, no parent, no watchers)")
+                        continue
+
+                    if not self._remove_internal_snapshots(img, name):
+                        print(f"    FAILED: could not remove internal snapshots")
+                        continue
+            except Exception as e:
+                print(f"    SKIPPED: {e}")
+                continue
+
+            if not self.dry_run:
+                try:
+                    rbd.RBD().remove(self.ioctx, name)
+                    print(f"    [v] Removed provably-orphaned ancestor: {name}")
+                except Exception as e:
+                    print(f"    [x] FAILED to remove: {e}")
+
     def _remove_namespace_if_empty(self):
         """If CL_RBD_NAMESPACE was set, remove it once confirmed empty of images/trash.
         Best-effort, never affects overall cleanup success."""
@@ -1330,6 +1399,7 @@ class OdfCleaner:
                 print(f"ERROR: Cleanup failed for {failed_count} items")
                 return False
             
+            self._cleanup_orphaned_ancestors()
             self._remove_namespace_if_empty()
             return True
             

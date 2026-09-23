@@ -308,7 +308,8 @@ Script generation defaults to actually completing the cleanup rather than just p
   - **KEEP:** a matching VSC/PV exists and its namespace is still active
   - **REVIEW:** a matching VSC/PV exists but its namespace is orphaned (delete the VSC/PV too)
   - **REVIEW (fail-safe):** VSCs/PVs couldn't be loaded at all - can't verify, so don't risk it
-  - **SAFE TO DELETE:** no RBD children and no matching VSC/PV reference found
+  - **REVIEW (external ODF):** no RBD children and no matching VSC/PV reference found, but `CL_POOL` is `ocpv-tenants` - confirmed live that a still-active guest cluster's own VolumeSnapshot/PV is invisible to this hub-only k8s check (a Bound PV backed by a currently-stopped VM has no RBD watcher either), so "no hub-side reference" isn't proof of no owner here. See `AGENTS.md`
+  - **SAFE TO DELETE:** no RBD children and no matching VSC/PV reference found (any other pool, where hub-side k8s state is the real owner)
 - **ERROR Handling:** Graceful handling of analysis failures
 
 #### **Key Point:**

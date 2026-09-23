@@ -365,6 +365,17 @@ Phase 2: Scanning for missing descendants...
 - Shows removal statistics, failed items, and final status
 - Calls `_final_verification()` if cleanup was successful
 
+### Phase 7: External Ancestor Orphan Cleanup
+
+#### `_find_external_ancestor_candidates()`
+**When:** After `build_tree()`
+**Purpose:** A root image (our GUID's own top-level volume) can itself be a clone of a csi-snap/csi-vol that isn't GUID-named and was never discovered as part of our tree (the "CSI-flattened snapshot root" pattern - see `AGENTS.md`). If found, its name is recorded as a candidate to recheck after this run
+
+#### `_cleanup_orphaned_ancestors()`
+**When:** After a fully-successful cleanup (`cleanup()`, only if `failed_count == 0`), before `_remove_namespace_if_empty()`
+**Purpose:** If removing our GUID's own tree just left one of those ancestor candidates with zero children, that's not a guess - we caused the transition ourselves in this exact run, so no other GUID/lab can still be referencing it
+**Does:** For each candidate, re-opens it fresh and requires **all** of: no parent of its own (true root, not mid-chain), zero remaining descendants, zero watchers - only then removes its internal snapshots and the image itself. Any one check failing just skips that candidate (logged, not fatal) - this never touches an ancestor that still has other children or is itself still someone else's clone
+
 #### Utility Methods:
 - `_clear_dependency_cache()` - Resets cached dependency analysis
 - `_update_removal_stats()` - Updates removal counters by image type
@@ -403,6 +414,7 @@ Phase 2: Scanning for missing descendants...
 - **Discovery Errors Never Silently Become Success:** any per-image open failure that isn't resolved by one of the above is appended to `self._discovery_errors` - `cleanup()` refuses to report "nothing found" success unless the discovered-items list is empty **and** no discovery errors occurred
 - **Trashed Snapshot Cleanup:** RBD's "clone v2" moves a deleted snapshot with live clones into a trash namespace instead of blocking the delete - confirmed against real cluster output that it's then unreachable by name at all (even `rbd snap rm --force` fails), only by id via `remove_snap_by_id()`
 - **Trash-Safe Descendant Discovery:** A trashed snapshot can still have a live clone child (that's exactly why it hasn't been purged yet) - but `list_descendants()` fails outright the moment any snapshot on an image is in the trash namespace, silently skipping that image's real children. `_direct_children_trash_safe()` is used as a fallback so this failure mode doesn't hide an active descendant
+- **External Ancestor Orphan Cleanup:** Ceph-CSI's own snapshot/clone flow deliberately severs the parent link on snapshot-source images (`flattenRbdImage()` etc.), so a csi-snap/csi-vol with live GUID-named children can look parentless while still very much in use - "parentless" alone never implies orphaned. The only case this cleans up automatically is one this run itself proved: if our own GUID's root was cloned from such an ancestor, and deleting our tree just left that ancestor with zero children, zero parent, and zero watchers, no other lab can be depending on it. See `_find_external_ancestor_candidates()`/`_cleanup_orphaned_ancestors()` above and "Unresolvable-by-name image" / parentless-csi-snap notes in `AGENTS.md` for the fuller background
 - **Final Verification:** Ensures complete cleanup
 
 ### Error Handling

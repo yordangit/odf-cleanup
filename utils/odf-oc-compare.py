@@ -514,6 +514,11 @@ class OdfOpenShiftComparator:
                             f"{k8s_check['vsc_name']} in orphaned namespace {ns_desc} "
                             f"(delete the VolumeSnapshotContent too)"
                         )
+                    elif self.pool_name == 'ocpv-tenants':
+                        analysis['recommendation'] = (
+                            'REVIEW - no RBD children, no VolumeSnapshotContent reference found, '
+                            'but ocpv-tenants is external ODF - cannot verify guest-cluster ownership'
+                        )
                     else:
                         analysis['recommendation'] = (
                             'SAFE TO DELETE - no RBD children, no VolumeSnapshotContent reference found'
@@ -621,6 +626,11 @@ class OdfOpenShiftComparator:
                             f"REVIEW - no RBD children, referenced by PersistentVolume "
                             f"{k8s_check['pv_name']} in orphaned namespace {ns_desc} "
                             f"(delete the PersistentVolume too)"
+                        )
+                    elif self.pool_name == 'ocpv-tenants':
+                        analysis['recommendation'] = (
+                            'REVIEW - no RBD children, no PersistentVolume reference found, '
+                            'but ocpv-tenants is external ODF - cannot verify guest-cluster ownership'
                         )
                     else:
                         analysis['recommendation'] = (
