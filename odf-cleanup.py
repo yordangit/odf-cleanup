@@ -38,7 +38,6 @@ class OdfImage:
         self.is_protected = is_protected
         self.in_trash = in_trash
         self.trash_id = trash_id
-        
         # Multi-phase operation metadata
         self.needs_restoration = False
         self.needs_flattening = False
@@ -47,6 +46,9 @@ class OdfImage:
         # Rbd_header is missing (Ceph metadata corruption), can't be opened
         # via rbd.Image() at all, needs a rados-level cleanup instead.
         self.phantom_image_id: Optional[str] = None
+        # Set when rbd_id/rbd_directory are both missing but rbd.RBD().list2()
+        # still resolved a real id - open by this id instead of by name.
+        self.open_by_id: Optional[str] = None
     
     def add_child(self, child: 'OdfImage'):
         """Add a child image"""
@@ -149,6 +151,8 @@ class OdfTree:
                 details.append(f"RESTORE: {image.restoration_reason}")
             if image.needs_flattening:
                 details.append("FLATTEN: Required")
+            if image.open_by_id:
+                details.append(f"UNRESOLVABLE BY NAME: recovered via id={image.open_by_id}")
             
             for detail in details:
                 print(f"{detail_prefix}    {detail}")
@@ -501,63 +505,74 @@ class OdfCleaner:
                 
         return False
     
+    def _build_odf_image(self, img, img_name: str, image_type: ImageType) -> OdfImage:
+        """Construct an OdfImage from an already-open rbd.Image handle."""
+        stat = img.stat()
+        creation_time = None
+        try:
+            ts = img.create_timestamp()
+            if isinstance(ts, datetime):
+                creation_time = str(ts)
+            elif ts:
+                creation_time = str(datetime.fromtimestamp(ts))
+            else:
+                creation_time = "Unknown"
+        except Exception:
+            creation_time = "Unknown"
+
+        parent_name = None
+        try:
+            parent_info = img.parent_info()
+            if parent_info:
+                parent_name = parent_info[1]
+        except:
+            pass
+
+        internal_snaps = [snap['name'] for snap in img.list_snaps()]
+
+        is_protected = False
+        try:
+            for snap in img.list_snaps():
+                try:
+                    if img.is_protected_snap(snap['name']):
+                        is_protected = True
+                        break
+                except Exception as snap_err:
+                    # Only show warning for unexpected errors, not "image not found"
+                    if "RBD image not found" not in str(snap_err):
+                        print(f"    Warning: Could not check protection for snapshot {snap['name']}: {snap_err}")
+        except Exception as snap_list_err:
+            print(f"    Warning: Could not list snapshots for {img_name}: {snap_list_err}")
+
+        image = OdfImage(
+            name=img_name,
+            image_type=image_type,
+            size=stat['size'],
+            creation_time=creation_time,
+            parent_name=parent_name,
+            is_protected=is_protected
+        )
+        image.internal_snaps = internal_snaps
+        return image
+
+    def _resolve_via_list2(self, image_name: str) -> Optional[str]:
+        """rbd_id.<name> and rbd_directory's name_<name> entry can both be
+        missing while the image is still real - rbd.RBD().list2() sometimes
+        resolves what direct omap lookups can't"""
+        try:
+            for item in rbd.RBD().list2(self.ioctx):
+                if item.get('name') == image_name:
+                    return item.get('id')
+        except Exception:
+            pass
+        return None
+
     def _create_image_from_rbd(self, img_name: str, image_type: ImageType) -> Optional[OdfImage]:
         """Create an OdfImage from an RBD image"""
         try:
             with rbd.Image(self.ioctx, img_name) as img:
-                # Get image info
-                stat = img.stat()
-                creation_time = None
-                try:
-                    ts = img.create_timestamp()
-                    if isinstance(ts, datetime):
-                        creation_time = str(ts)
-                    elif ts:
-                        creation_time = str(datetime.fromtimestamp(ts))
-                    else:
-                        creation_time = "Unknown"
-                except Exception:
-                    creation_time = "Unknown"
-                
-                # Get parent info
-                parent_name = None
-                try:
-                    parent_info = img.parent_info()
-                    if parent_info:
-                        parent_name = parent_info[1]
-                except:
-                    pass
-                
-                # Get internal snapshots
-                internal_snaps = [snap['name'] for snap in img.list_snaps()]
-                
-                # Check if any snapshots are protected
-                is_protected = False
-                try:
-                    for snap in img.list_snaps():
-                        try:
-                            if img.is_protected_snap(snap['name']):
-                                is_protected = True
-                                break
-                        except Exception as snap_err:
-                            # Only show warning for unexpected errors, not "image not found"
-                            if "RBD image not found" not in str(snap_err):
-                                print(f"    Warning: Could not check protection for snapshot {snap['name']}: {snap_err}")
-                except Exception as snap_list_err:
-                    print(f"    Warning: Could not list snapshots for {img_name}: {snap_list_err}")
-                
-                image = OdfImage(
-                    name=img_name,
-                    image_type=image_type,
-                    size=stat['size'],
-                    creation_time=creation_time,
-                    parent_name=parent_name,
-                    is_protected=is_protected
-                )
-                image.internal_snaps = internal_snaps
-                
-                return image
-                
+                return self._build_odf_image(img, img_name, image_type)
+
         except Exception as e:
             phantom_id = self._check_phantom_entry(img_name)
             if phantom_id:
@@ -565,7 +580,21 @@ class OdfCleaner:
                 image = OdfImage(name=img_name, image_type=image_type)
                 image.phantom_image_id = phantom_id
                 return image
+
+            recovered_id = self._resolve_via_list2(img_name)
+            if recovered_id:
+                try:
+                    with rbd.Image(self.ioctx, image_id=recovered_id) as img:
+                        print(f"  RECOVERED via id lookup: {img_name} is unresolvable by name "
+                              f"(rbd_id/rbd_directory both missing) but opened fine by id={recovered_id}")
+                        image = self._build_odf_image(img, img_name, image_type)
+                        image.open_by_id = recovered_id
+                        return image
+                except Exception as e2:
+                    print(f"Error opening recovered id {recovered_id} for {img_name}: {e2}")
+
             print(f"Error creating image for {img_name}: {e}")
+            self._discovery_errors.append(f"image {img_name}: {e}")
             return None
 
     def _check_phantom_entry(self, image_name: str) -> Optional[str]:
@@ -875,6 +904,8 @@ class OdfCleaner:
         try:
             needs_flatten = image.needs_flattening or self._needs_fallback_flattening(image)
             strategy = []
+            if image.open_by_id:
+                strategy.append(f"open by id={image.open_by_id} (rbd_id/rbd_directory missing)")
             if image.in_trash:
                 strategy.append("restore from trash")
             if needs_flatten:
@@ -991,10 +1022,17 @@ class OdfCleaner:
         raise RuntimeError(f"none of {self.WATCHER_METHOD_NAMES} found on rbd.Image "
                             f"for {image_name} - unknown Ceph client binding")
 
+    def _open_by_ref(self, image: OdfImage):
+        """Open by name, or by id if OdfImage.open_by_id was set during
+        discovery (name resolution known broken for this one)."""
+        if image.open_by_id:
+            return rbd.Image(self.ioctx, image_id=image.open_by_id)
+        return rbd.Image(self.ioctx, image.name)
+
     def _remove_active_image(self, image: OdfImage) -> bool:
         """Remove an active RBD image (volumes, csi-snaps)"""
         try:
-            with rbd.Image(self.ioctx, image.name) as img:
+            with self._open_by_ref(image) as img:
                 # Watcher failsafe: list_descendants() only catches RBD clone
                 # children. Refuse to delete anything that's currently watched.
                 try:

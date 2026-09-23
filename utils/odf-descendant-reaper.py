@@ -87,6 +87,9 @@ class DescendantReaper:
         self.keyring = None
         self.client_name = None
         self.my_instance_id = None
+        # name -> id, for names where rbd_id/rbd_directory are both missing
+        # but rbd.RBD().list2() still resolved a real id (see _open_by_ref).
+        self._id_fallback: Dict[str, str] = {}
 
     def connect(self) -> bool:
         """Connect to ODF cluster using the same env vars as the other tools."""
@@ -224,6 +227,42 @@ class DescendantReaper:
         """Human-readable name of whichever pattern _check_phantom_entry()
         last confirmed, for announcing the strategy before acting on it."""
         return "missing rbd_id repair" if self._phantom_pattern == 'missing_rbdid' else "phantom entry removal"
+
+    def _resolve_via_list2(self, image_name: str) -> Optional[str]:
+        """rbd_id.<name> and rbd_directory's name_<name> entry can both be
+        missing while the image is still real - rbd.RBD().list2() sometimes
+        resolves what direct omap lookups can't (mechanism unconfirmed,
+        behavior confirmed live - see Documentation/odf-descendant-reaper.md)."""
+        try:
+            for item in rbd.RBD().list2(self.ioctx):
+                if item.get('name') == image_name:
+                    return item.get('id')
+        except Exception:
+            pass
+        return None
+
+    def _open_by_ref(self, image_name: str):
+        """Open by name; if that's known-broken for this name (cached from a
+        prior call) or fails now, fall back to opening by id via
+        _resolve_via_list2(). Raises the original name-open exception if the
+        id fallback doesn't help either, so phantom-entry detection upstream
+        still fires normally."""
+        if image_name in self._id_fallback:
+            return rbd.Image(self.ioctx, image_id=self._id_fallback[image_name])
+        try:
+            return rbd.Image(self.ioctx, image_name)
+        except Exception as e:
+            recovered_id = self._resolve_via_list2(image_name)
+            if recovered_id:
+                try:
+                    img = rbd.Image(self.ioctx, image_id=recovered_id)
+                    self._id_fallback[image_name] = recovered_id
+                    print(f"    [i] {image_name} unresolvable by name (rbd_id/rbd_directory "
+                          f"both missing) - recovered via id={recovered_id}")
+                    return img
+                except Exception:
+                    pass
+            raise e
 
     def _execute_phantom_cleanup(self, image_name: str, image_id: str) -> bool:
         """Actually applies whichever pattern _check_phantom_entry() last
@@ -515,7 +554,7 @@ class DescendantReaper:
             return node, None
 
         try:
-            with rbd.Image(self.ioctx, image_name) as img:
+            with self._open_by_ref(image_name) as img:
                 # NOTE: on Ceph 18.2.8 (reef)/python3-rbd, create_timestamp()
                 # has consistently come back exactly 5h ahead of access_
                 # timestamp()/modify_timestamp().
@@ -631,7 +670,7 @@ class DescendantReaper:
         while queue:
             name = queue.pop(0)
             try:
-                with rbd.Image(self.ioctx, name) as img:
+                with self._open_by_ref(name) as img:
                     direct, ok = self._direct_children_trash_safe(img, name, execute)
             except Exception:
                 all_ok = False
@@ -652,7 +691,7 @@ class DescendantReaper:
         """Returns (roots, error, phantom_image_id). error != None means the
         volume couldn't be opened - not the same as "zero descendants"."""
         try:
-            with rbd.Image(self.ioctx, volume_name) as img:
+            with self._open_by_ref(volume_name) as img:
                 try:
                     flat = [d for d in img.list_descendants() if not d.get('trash', False)]
                 except Exception:
@@ -760,7 +799,7 @@ class DescendantReaper:
         order = list(root.all_nodes())[::-1]  # leaves first, root last
         for node in order:
             try:
-                with rbd.Image(self.ioctx, node.name) as img:
+                with self._open_by_ref(node.name) as img:
                     for snap in node.snapshots:
                         if snap['is_trash']:
                             # Only reachable by id - name-based lookup always
@@ -790,7 +829,7 @@ class DescendantReaper:
         removed above). Re-check watchers now rather than trusting 
         rbd.RBD().remove() to block on them (it doesn't)."""
         try:
-            with rbd.Image(self.ioctx, name) as img:
+            with self._open_by_ref(name) as img:
                 watchers = self._get_watchers(img, name)
                 if watchers:
                     print(f"  [x] SKIPPED removing {name}: active watcher(s) {watchers}")
@@ -919,7 +958,7 @@ class DescendantReaper:
         for name in names:
             print(f"\n{name}:")
             try:
-                with rbd.Image(self.ioctx, name) as img:
+                with self._open_by_ref(name) as img:
                     watchers = self._get_watchers(img, name)
                     if watchers:
                         print(f"  [x] SKIPPED: now has active watcher(s) {watchers} - state changed since analysis")
@@ -967,7 +1006,7 @@ class DescendantReaper:
                 continue
 
             try:
-                with rbd.Image(self.ioctx, name) as img:
+                with self._open_by_ref(name) as img:
                     for snap in snaps:
                         if snap['is_trash']:
                             img.remove_snap_by_id(snap['id'])
