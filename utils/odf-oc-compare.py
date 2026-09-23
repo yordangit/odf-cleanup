@@ -1191,7 +1191,8 @@ echo "Cleanup script completed!"
 if [ -f "$NEEDS_REVIEW_FILE" ]; then
     echo ""
     echo "$(wc -l < "$NEEDS_REVIEW_FILE") GUID(s) still need manual review - see $NEEDS_REVIEW_FILE"
-    echo "Investigate each with: CL_LAB=<guid> python3 $ODF_REAPER"
+    echo "Investigate each with: [CL_RBD_NAMESPACE=<ns>] CL_LAB=<guid> python3 $ODF_REAPER"
+    echo "Each entry's exact follow-up command was already printed above when it failed"
 fi
 """
         
