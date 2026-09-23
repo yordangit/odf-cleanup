@@ -968,10 +968,6 @@ class OdfOpenShiftComparator:
     
     def generate_cleanup_script(self, output_file: str = "cleanup_orphaned_guids.sh"):
         """Generate bash script for automated cleanup"""
-        # Parentless csi-snap/csi-vol images verified SAFE TO DELETE (zero RBD
-        # children AND no live k8s reference) - these have no GUID, so
-        # odf-cleanup.py can't process them. Handled separately via the reaper's
-        # CL_CLEANUP_LIST mode.
         # Grouped by RBD namespace since the reaper only targets one namespace
         # per run (CL_RBD_NAMESPACE) - most will be a single default-namespace group.
         safe_csi_leftovers_by_ns: Dict[str, List[str]] = {}
