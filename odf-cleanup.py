@@ -446,6 +446,11 @@ class OdfCleaner:
                             
                             # Handle active descendants - add to discovery
                             if desc_name not in discovered_names:
+                                desc_pool = desc.get('pool') if isinstance(desc, dict) else None
+                                if desc_pool and desc_pool != self.pool_name:
+                                    print(f"    [!] CROSS-POOL DESCENDANT: {desc_name} lives in pool "
+                                          f"'{desc_pool}', not '{self.pool_name}'")
+                                    continue
                                 # Determine image type based on name
                                 desc_image_type = ImageType.CSI_SNAP if 'csi-snap' in desc_name else ImageType.VOLUME
                                 new_image = self._create_image_from_rbd(desc_name, desc_image_type)
@@ -864,9 +869,19 @@ class OdfCleaner:
         print(f"  Removing {image.image_type.value}: {image.name}")
 
         if image.phantom_image_id:
+            print(f"    Strategy: phantom entry cleanup (dangling rbd_id, missing rbd_header)")
             return self._execute_phantom_cleanup(image.name, image.phantom_image_id)
 
         try:
+            needs_flatten = image.needs_flattening or self._needs_fallback_flattening(image)
+            strategy = []
+            if image.in_trash:
+                strategy.append("restore from trash")
+            if needs_flatten:
+                strategy.append("flatten")
+            strategy.append("remove")
+            print(f"    Strategy: {' -> '.join(strategy)}")
+
             # Handle trash items first - restore them temporarily
             if image.in_trash:
                 if not self._restore_from_trash(image):
@@ -877,7 +892,7 @@ class OdfCleaner:
                 # After restoration, treat as active image for deletion
             
             # Handle multi-phase operations or fallback flattening
-            if image.needs_flattening or self._needs_fallback_flattening(image):
+            if needs_flatten:
                 if not self._flatten_image(image):
                     return False
             
@@ -1008,6 +1023,11 @@ class OdfCleaner:
                         desc_names.append(name)
                     print(f"    Descendants: {desc_names}")
                     print(f"    Raw descendant data: {active_descendants}")
+                    for d in active_descendants:
+                        d_pool = d.get('pool') if isinstance(d, dict) else None
+                        if d_pool and d_pool != self.pool_name:
+                            print(f"    [!] CROSS-POOL DESCENDANT: {d.get('image', d)} lives in pool "
+                                  f"'{d_pool}', not '{self.pool_name}'")
                     return False
                 
                 # Remove internal snapshots first

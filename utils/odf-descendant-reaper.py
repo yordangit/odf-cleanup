@@ -220,6 +220,11 @@ class DescendantReaper:
             f"    rados -p {self.pool_name} rm {id_obj}"
         )
 
+    def _phantom_strategy_label(self) -> str:
+        """Human-readable name of whichever pattern _check_phantom_entry()
+        last confirmed, for announcing the strategy before acting on it."""
+        return "missing rbd_id repair" if self._phantom_pattern == 'missing_rbdid' else "phantom entry removal"
+
     def _execute_phantom_cleanup(self, image_name: str, image_id: str) -> bool:
         """Actually applies whichever pattern _check_phantom_entry() last
         confirmed: recreates the missing rbd_id pointer ('missing_rbdid'), or
@@ -498,11 +503,16 @@ class DescendantReaper:
         raise RuntimeError(f"none of {self.WATCHER_METHOD_NAMES} found on rbd.Image "
                             f"for {image_name} - unknown Ceph client binding")
 
-    def _inspect_node(self, image_name: str) -> (ChainNode, Optional[str]):
+    def _inspect_node(self, image_name: str, pool: Optional[str] = None) -> (ChainNode, Optional[str]):
         """Open one image, collect its watcher/timestamp/snapshot info, and
         return its parent's name (no recursion - see analyze_volume)."""
         node = ChainNode(image_name, depth=0)  # depth is fixed up by the caller
         parent_name = None
+
+        if pool and pool != self.pool_name:
+            node.error = (f"CROSS-POOL DESCENDANT: lives in pool '{pool}', not '{self.pool_name}'"
+                          f"this tool only operates on '{self.pool_name}' and can't inspect/remove it")
+            return node, None
 
         try:
             with rbd.Image(self.ioctx, image_name) as img:
@@ -589,14 +599,11 @@ class DescendantReaper:
                 children.extend(img.list_children2())
             except AttributeError:
                 try:
-                    children.extend({'image': c[1], 'trash': False} for c in img.list_children())
+                    children.extend({'pool': c[0], 'image': c[1], 'trash': False} for c in img.list_children())
                 except Exception:
                     ok = False
             except Exception:
-                # Can be a genuinely unresolvable case, or the "orphaned
-                # clone" corruption pattern documented in
-                # Documentation/odf-descendant-reaper.md - try to auto-repair
-                # it before giving up (actual removal still needs execute=True).
+                # Can be a genuinely unresolvable case, or the "orphaned clone" corruption
                 repaired = 'trash' in snap and self._diagnose_and_repair_orphan(image_name, snap['id'], execute)
                 if repaired:
                     try:
@@ -660,10 +667,13 @@ class DescendantReaper:
             return [], error, phantom_id
 
         names = []
+        pool_of: Dict[str, str] = {}
         for desc in flat:
             name = desc.get('name') or desc.get('image')
             if name:
                 names.append(name)
+                if desc.get('pool'):
+                    pool_of[name] = desc['pool']
 
         if not names:
             return [], None, None
@@ -671,7 +681,7 @@ class DescendantReaper:
         nodes: Dict[str, ChainNode] = {}
         parent_of: Dict[str, str] = {}
         for name in names:
-            node, parent_name = self._inspect_node(name)
+            node, parent_name = self._inspect_node(name, pool=pool_of.get(name))
             nodes[name] = node
             if parent_name:
                 parent_of[name] = parent_name
@@ -836,7 +846,7 @@ class DescendantReaper:
                 any_error = True
                 print(f"  [x] ERROR: {error}")
                 if execute and phantom_id:
-                    print(f"  Executing phantom entry cleanup for {vol}...")
+                    print(f"  Performing {self._phantom_strategy_label()} for {vol}...")
                     if self._execute_phantom_cleanup(vol, phantom_id):
                         any_error = False  # resolved - was the only issue for this volume
                     else:
@@ -930,6 +940,7 @@ class DescendantReaper:
                 phantom_id = self._check_phantom_entry(name)
                 if phantom_id:
                     if execute:
+                        print(f"  Performing {self._phantom_strategy_label()}...")
                         if self._execute_phantom_cleanup(name, phantom_id):
                             removed += 1
                         else:
