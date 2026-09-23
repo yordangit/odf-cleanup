@@ -120,6 +120,11 @@ graph TD
 - `_check_missing_rbdid()`: reads `rbd_directory`'s `name_<name>` omap value directly (`_get_omap_value()`), decodes it, and confirms the resulting id's header exists
 - Returns the resolved `image_id` for either confirmed pattern, `None` otherwise (never guesses on a third/unknown state)
 
+#### `_resolve_via_list2()` / `_open_by_ref()`
+**When:** An image fails open-by-name and matches neither pattern above (`rbd_id` **and** `rbd_directory` both genuinely missing - confirmed via a full omap scan in real cases, not a corrupted/unrepairable state)
+**Purpose:** `rbd.RBD().list2()` can still resolve a real id for these - the image opens and behaves completely normally by id (zero real watchers/children once the reaper's own inspection watch is filtered out). Mechanism unexplained (see "Unresolvable-by-name image" in `AGENTS.md`), behavior confirmed live on 3/3 real cases
+**Does:** `_open_by_ref()` is a drop-in replacement for `rbd.Image(self.ioctx, name)` used at every call site (`_inspect_node`, `analyze_volume`, `_execute_chain_removal`, `_remove_volume_directly`, `cleanup_named_images`) - tries by name first, falls back to `_resolve_via_list2()` + open-by-id on failure, caches the resolved id per name for the rest of the run, and prints `[i] ... recovered via id=...` the first time it fires. Raises the original name-open error if the id fallback doesn't help either, so phantom-entry detection downstream still triggers normally. Removal itself still uses the name (`rbd.RBD().remove()`, confirmed working even when open-by-name fails)
+
 ### Phase 4: Classification
 
 #### `classify()`
