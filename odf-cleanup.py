@@ -419,7 +419,7 @@ class OdfCleaner:
                 scanned_names.add(image.name)
                 
                 try:
-                    with rbd.Image(self.ioctx, image.name) as img:
+                    with self._open_by_ref(image) as img:
                         try:
                             descendants = list(img.list_descendants())
                         except Exception:
@@ -954,7 +954,7 @@ class OdfCleaner:
         print(f"    Flattening image: {image.name}")
         
         try:
-            with rbd.Image(self.ioctx, image.name) as img:
+            with self._open_by_ref(image) as img:
                 # Check if image actually needs flattening
                 try:
                     parent_info = img.parent_info()
