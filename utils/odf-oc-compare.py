@@ -39,6 +39,12 @@ VOLUME_GUID_PATTERN = re.compile(r'(?:' + '|'.join(CLUSTER_NAME_PREFIXES) + r')-
 # pattern for those too (see discover_odf_guids()'s empty-namespace check).
 NAMESPACE_GUID_PATTERN = re.compile(r'sandbox-([a-z0-9]+)-')
 
+# Ceph-CSI NetworkFence metadata keys: .rbd.csi.ceph.com/{clientaddress,userid}/<volumeHandle>/<nodeName>
+# The trailing node name follows the host cluster's own VM-naming convention
+# (e.g. worker-cluster-{guid}-N), so it carries the lab GUID even for external
+# ODF volumes with no GUID in their own name (confirmed live, see AGENTS.md).
+FENCING_KEY_MARKERS = ('/clientaddress/', '/userid/')
+
 
 class OdfOpenShiftComparator:
     """Main class for comparing ODF volumes with OpenShift namespaces"""
@@ -560,6 +566,30 @@ class OdfOpenShiftComparator:
 
         return result
 
+    def _check_fencing_key_guid(self, img) -> Dict:
+        """Check Ceph-CSI NetworkFence metadata (FENCING_KEY_MARKERS) for a
+        GUID embedded in the node name. Returns {'found', 'guid_active', 'node', 'guid'}."""
+        result = {'found': False, 'guid_active': False, 'node': None, 'guid': None}
+        try:
+            metadata = dict(img.metadata_list())
+        except Exception:
+            return result
+
+        for key in metadata:
+            if not any(m in key for m in FENCING_KEY_MARKERS):
+                continue
+            node = key.rsplit('/', 1)[-1]
+            result['found'] = True
+            if result['node'] is None:
+                result['node'] = node  # keep first node name seen, for reporting
+            match = next((g for g in self.active_namespace_guids if g in node), None)
+            if match:
+                result['guid_active'] = True
+                result['guid'] = match
+                result['node'] = node
+                return result  # active match found, no need to keep scanning
+        return result
+
     def _analyze_parentless_csi_vol(self, csi_vol_name: str):
         """Analyze a parentless csi-vol volume to find children and their GUIDs"""
         if csi_vol_name in self.parentless_csi_vols:
@@ -623,10 +653,23 @@ class OdfOpenShiftComparator:
                             f"(delete the PersistentVolume too)"
                         )
                     elif self.pool_name == 'ocpv-tenants':
-                        analysis['recommendation'] = (
-                            'REVIEW - no RBD children, no PersistentVolume reference found, '
-                            'but ocpv-tenants is external ODF - cannot verify guest-cluster ownership'
-                        )
+                        fencing = self._check_fencing_key_guid(img)
+                        if fencing['found'] and fencing['guid_active']:
+                            analysis['recommendation'] = (
+                                f"REVIEW - no RBD children, no PV reference found, but fencing "
+                                f"metadata's node '{fencing['node']}' matches active GUID "
+                                f"'{fencing['guid']}' - lab still exists"
+                            )
+                        elif fencing['found']:
+                            analysis['recommendation'] = (
+                                f"SAFE TO DELETE - no RBD children, no PV reference found, "
+                                f"fencing metadata's node '{fencing['node']}' matches no active GUID"
+                            )
+                        else:
+                            analysis['recommendation'] = (
+                                'REVIEW - no RBD children, no PersistentVolume reference found, '
+                                'and no fencing metadata to check - cannot verify guest-cluster ownership'
+                            )
                     else:
                         analysis['recommendation'] = (
                             'SAFE TO DELETE - no RBD children, no PersistentVolume reference found'
@@ -963,17 +1006,6 @@ class OdfOpenShiftComparator:
     
     def generate_cleanup_script(self, output_file: str = "cleanup_orphaned_guids.sh"):
         """Generate bash script for automated cleanup"""
-        # Parentless csi-snap/csi-vol images verified SAFE TO DELETE (zero RBD
-        # children AND no live k8s reference) - these have no GUID, so
-        # odf-cleanup.py can't process them. Handled separately via the reaper's
-        # CL_CLEANUP_LIST mode. csi-vol on ocpv-tenants (external ODF) is capped
-        # at REVIEW instead - zero RBD children + no hub-side PV reference
-        # doesn't rule out a still-active guest-cluster owner there (confirmed
-        # live, see AGENTS.md). csi-snap is unaffected even on ocpv-tenants - a
-        # genuine parentless-and-childless snap isn't explained by any real
-        # workflow in these labs.
-        # Grouped by RBD namespace since the reaper only targets one namespace
-        # per run (CL_RBD_NAMESPACE) - most will be a single default-namespace group.
         safe_csi_leftovers_by_ns: Dict[str, List[str]] = {}
         for n, a in self.parentless_csi_snaps.items():
             if a['recommendation'].startswith('SAFE TO DELETE'):
