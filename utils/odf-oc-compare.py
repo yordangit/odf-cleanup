@@ -514,11 +514,6 @@ class OdfOpenShiftComparator:
                             f"{k8s_check['vsc_name']} in orphaned namespace {ns_desc} "
                             f"(delete the VolumeSnapshotContent too)"
                         )
-                    elif self.pool_name == 'ocpv-tenants':
-                        analysis['recommendation'] = (
-                            'REVIEW - no RBD children, no VolumeSnapshotContent reference found, '
-                            'but ocpv-tenants is external ODF - cannot verify guest-cluster ownership'
-                        )
                     else:
                         analysis['recommendation'] = (
                             'SAFE TO DELETE - no RBD children, no VolumeSnapshotContent reference found'
@@ -968,6 +963,15 @@ class OdfOpenShiftComparator:
     
     def generate_cleanup_script(self, output_file: str = "cleanup_orphaned_guids.sh"):
         """Generate bash script for automated cleanup"""
+        # Parentless csi-snap/csi-vol images verified SAFE TO DELETE (zero RBD
+        # children AND no live k8s reference) - these have no GUID, so
+        # odf-cleanup.py can't process them. Handled separately via the reaper's
+        # CL_CLEANUP_LIST mode. csi-vol on ocpv-tenants (external ODF) is capped
+        # at REVIEW instead - zero RBD children + no hub-side PV reference
+        # doesn't rule out a still-active guest-cluster owner there (confirmed
+        # live, see AGENTS.md). csi-snap is unaffected even on ocpv-tenants - a
+        # genuine parentless-and-childless snap isn't explained by any real
+        # workflow in these labs.
         # Grouped by RBD namespace since the reaper only targets one namespace
         # per run (CL_RBD_NAMESPACE) - most will be a single default-namespace group.
         safe_csi_leftovers_by_ns: Dict[str, List[str]] = {}
